@@ -1,4 +1,5 @@
 import { Money } from "./money";
+import { LedgerDirection } from "./wallet-ledger-entry";
 
 export enum WagerTransactionKind {
   Opening = "OPENING",
@@ -61,6 +62,20 @@ export class InvalidTransactionStateError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "InvalidTransactionStateError";
+  }
+}
+
+export class InvalidReferenceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidReferenceError";
+  }
+}
+
+export class ReferenceNotReadyError extends Error {
+  constructor() {
+    super("A referência ainda não está disponível para processamento.");
+    this.name = "ReferenceNotReadyError";
   }
 }
 
@@ -167,6 +182,97 @@ export class WagerTransaction {
     }
 
     return transaction;
+  }
+
+  ledgerDirectionFor(reference?: WagerTransaction): LedgerDirection {
+    if (this.referenceExternalTransactionId !== undefined) {
+      if (reference === undefined) {
+        throw new ReferenceNotReadyError();
+      }
+
+      this.validateReference(reference);
+    } else if (reference !== undefined) {
+      throw new InvalidReferenceError(
+        "A operação não declarou uma referência externa.",
+      );
+    }
+
+    switch (this.kind) {
+      case WagerTransactionKind.Bet:
+        return LedgerDirection.Debit;
+
+      case WagerTransactionKind.Opening:
+      case WagerTransactionKind.Win:
+      case WagerTransactionKind.Refund:
+        return LedgerDirection.Credit;
+
+      case WagerTransactionKind.Rollback:
+        if (reference === undefined) {
+          throw new ReferenceNotReadyError();
+        }
+
+        return reference.kind === WagerTransactionKind.Bet
+          ? LedgerDirection.Credit
+          : LedgerDirection.Debit;
+
+      case WagerTransactionKind.Loss:
+        throw new InvalidWagerTransactionError(
+          "LOSS não possui direção de ledger.",
+        );
+
+      default:
+        throw new InvalidWagerTransactionError("Tipo de operação inválido.");
+    }
+  }
+
+  private validateReference(reference: WagerTransaction): void {
+    const matchesContext =
+      reference.id !== this.id &&
+      reference.externalTransactionId === this.referenceExternalTransactionId &&
+      reference.providerId === this.providerId &&
+      reference.playerId === this.playerId &&
+      reference.walletId === this.walletId &&
+      reference.money.currency === this.money.currency &&
+      reference.roundId === this.roundId;
+
+    if (!matchesContext) {
+      throw new InvalidReferenceError(
+        "A referência não corresponde ao contexto da operação.",
+      );
+    }
+
+    const acceptsBet =
+      (this.kind === WagerTransactionKind.Win ||
+        this.kind === WagerTransactionKind.Refund) &&
+      reference.kind === WagerTransactionKind.Bet;
+
+    const acceptsRollback =
+      this.kind === WagerTransactionKind.Rollback &&
+      (reference.kind === WagerTransactionKind.Bet ||
+        reference.kind === WagerTransactionKind.Win ||
+        reference.kind === WagerTransactionKind.Refund);
+
+    if (!acceptsBet && !acceptsRollback) {
+      throw new InvalidReferenceError(
+        "Tipo de referência não permitido para esta operação.",
+      );
+    }
+
+    if (reference.status !== WagerTransactionStatus.Processed) {
+      if (!reference.isTerminal()) {
+        throw new ReferenceNotReadyError();
+      }
+
+      throw new InvalidReferenceError(
+        "Uma operação rejeitada ou com falha não pode ser referenciada.",
+      );
+    }
+
+    if (this.requiresReference() && !this.money.equals(reference.money)) {
+      throw new InvalidReferenceError(
+        "A reversão não pode ter valor diferente de valor da referência.",
+      );
+    }
   }
 
   static rehydrate(state: WagerTransactionState): WagerTransaction {

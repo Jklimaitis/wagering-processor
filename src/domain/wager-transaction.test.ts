@@ -2,12 +2,15 @@ import { expect, test } from 'bun:test';
 import { Money } from './money';
 import {
   FailureCode,
+  InvalidReferenceError,
   InvalidTransactionStateError,
   InvalidWagerTransactionError,
+  ReferenceNotReadyError,
   WagerTransaction,
   WagerTransactionKind,
   WagerTransactionStatus,
 } from './wager-transaction';
+import { LedgerDirection } from './wallet-ledger-entry';
 import type {
   CreateWagerTransactionProps,
 } from './wager-transaction';
@@ -299,4 +302,223 @@ test('reidrata preservando referência, falha e data de processamento', () => {
   });
 
   expect(rejected.failureCode).toBe(FailureCode.InsufficientBalance);
+});
+
+function processedReference(
+  overrides: Partial<CreateWagerTransactionProps> = {},
+): WagerTransaction {
+  const needsReference =
+    overrides.kind === WagerTransactionKind.Refund ||
+    overrides.kind === WagerTransactionKind.Rollback;
+
+  const props = transactionProps({
+    id: 'original-id',
+    externalTransactionId: 'original-1',
+    idempotencyKey: 'provider-1:original-1',
+    referenceExternalTransactionId:
+      needsReference ? 'older-1' : undefined,
+    ...overrides,
+  });
+
+  const reference = WagerTransaction.create(props);
+
+  reference.markProcessed(
+    props.referenceExternalTransactionId === undefined
+      ? undefined
+      : 'older-internal-id',
+  );
+
+  return reference;
+}
+
+test('define as direções de BET, WIN e OPENING', () => {
+  const cases = [
+    {
+      kind: WagerTransactionKind.Bet,
+      direction: LedgerDirection.Debit,
+    },
+    {
+      kind: WagerTransactionKind.Win,
+      direction: LedgerDirection.Credit,
+    },
+    {
+      kind: WagerTransactionKind.Opening,
+      direction: LedgerDirection.Credit,
+    },
+  ];
+
+  for (const item of cases) {
+    const transaction = WagerTransaction.create(transactionProps({
+      kind: item.kind,
+    }));
+
+    expect(transaction.ledgerDirectionFor()).toBe(item.direction);
+  }
+});
+
+test('LOSS não possui direção de ledger', () => {
+  const transaction = WagerTransaction.create(transactionProps({
+    kind: WagerTransactionKind.Loss,
+  }));
+
+  expect(() => transaction.ledgerDirectionFor())
+    .toThrow(InvalidWagerTransactionError);
+});
+
+test('REFUND de uma BET processada gera crédito', () => {
+  const transaction = referencedTransaction();
+
+  expect(transaction.ledgerDirectionFor(processedReference()))
+    .toBe(LedgerDirection.Credit);
+});
+
+test.each([
+  WagerTransactionKind.Bet,
+  WagerTransactionKind.Win,
+  WagerTransactionKind.Refund,
+])('ROLLBACK inverte o efeito de %s', (kind) => {
+  const transaction = WagerTransaction.create(transactionProps({
+    kind: WagerTransactionKind.Rollback,
+    referenceExternalTransactionId: 'original-1',
+  }));
+
+  const reference = processedReference({ kind });
+
+  const expected = kind === WagerTransactionKind.Bet
+    ? LedgerDirection.Credit
+    : LedgerDirection.Debit;
+
+  expect(transaction.ledgerDirectionFor(reference)).toBe(expected);
+});
+
+test('WIN pode referenciar BET com valor diferente', () => {
+  const transaction = WagerTransaction.create(transactionProps({
+    kind: WagerTransactionKind.Win,
+    referenceExternalTransactionId: 'original-1',
+    money: Money.from({ amount: '80.00', currency: 'BRL' }),
+  }));
+
+  expect(transaction.ledgerDirectionFor(processedReference()))
+    .toBe(LedgerDirection.Credit);
+});
+
+test('rejeita referência de outro contexto', () => {
+  const transaction = referencedTransaction();
+
+  const mismatches: Partial<CreateWagerTransactionProps>[] = [
+    { providerId: 'other-provider' },
+    { playerId: 'other-player' },
+    { walletId: 'other-wallet' },
+    { roundId: 'other-round' },
+    { externalTransactionId: 'other-external-id' },
+    { money: Money.from({ amount: '25.00', currency: 'USD' }) },
+  ];
+
+  for (const overrides of mismatches) {
+    const reference = processedReference(overrides);
+
+    expect(() => transaction.ledgerDirectionFor(reference))
+      .toThrow(InvalidReferenceError);
+  }
+
+  expect(transaction.status).toBe(WagerTransactionStatus.Pending);
+});
+
+test('rejeita tipos de referência não permitidos', () => {
+  const refund = referencedTransaction();
+
+  expect(() => refund.ledgerDirectionFor(
+    processedReference({ kind: WagerTransactionKind.Win }),
+  )).toThrow(InvalidReferenceError);
+
+  const win = WagerTransaction.create(transactionProps({
+    kind: WagerTransactionKind.Win,
+    referenceExternalTransactionId: 'original-1',
+  }));
+
+  expect(() => win.ledgerDirectionFor(
+    processedReference({ kind: WagerTransactionKind.Refund }),
+  )).toThrow(InvalidReferenceError);
+
+  const rollback = WagerTransaction.create(transactionProps({
+    kind: WagerTransactionKind.Rollback,
+    referenceExternalTransactionId: 'original-1',
+  }));
+
+  expect(() => rollback.ledgerDirectionFor(
+    processedReference({ kind: WagerTransactionKind.Loss }),
+  )).toThrow(InvalidReferenceError);
+});
+
+test('rejeita reversão parcial em REFUND e ROLLBACK', () => {
+  const reference = processedReference();
+
+  for (const kind of [
+    WagerTransactionKind.Refund,
+    WagerTransactionKind.Rollback,
+  ]) {
+    const transaction = WagerTransaction.create(transactionProps({
+      kind,
+      referenceExternalTransactionId: 'original-1',
+      money: Money.from({ amount: '10.00', currency: 'BRL' }),
+    }));
+
+    expect(() => transaction.ledgerDirectionFor(reference))
+      .toThrow(InvalidReferenceError);
+  }
+});
+
+test('sinaliza referência ausente ou ainda pendente', () => {
+  const transaction = referencedTransaction();
+
+  expect(() => transaction.ledgerDirectionFor())
+    .toThrow(ReferenceNotReadyError);
+
+  const pendingReference = WagerTransaction.create(transactionProps({
+    id: 'original-id',
+    externalTransactionId: 'original-1',
+    idempotencyKey: 'provider-1:original-1',
+  }));
+
+  expect(() => transaction.ledgerDirectionFor(pendingReference))
+    .toThrow(ReferenceNotReadyError);
+
+  expect(transaction.status).toBe(WagerTransactionStatus.Pending);
+});
+
+test('rejeita referência que terminou rejeitada ou com falha', () => {
+  const transaction = referencedTransaction();
+
+  for (const status of [
+    WagerTransactionStatus.Rejected,
+    WagerTransactionStatus.Failed,
+  ]) {
+    const reference = WagerTransaction.create(transactionProps({
+      id: 'original-id',
+      externalTransactionId: 'original-1',
+      idempotencyKey: 'provider-1:original-1',
+    }));
+
+    if (status === WagerTransactionStatus.Rejected) {
+      reference.reject(FailureCode.InsufficientBalance);
+    } else {
+      reference.fail(FailureCode.PermanentInfrastructureError);
+    }
+
+    expect(() => transaction.ledgerDirectionFor(reference))
+      .toThrow(InvalidReferenceError);
+  }
+});
+
+test('rejeita referência não declarada e autorreferência', () => {
+  const bet = WagerTransaction.create(transactionProps());
+
+  expect(() => bet.ledgerDirectionFor(processedReference()))
+    .toThrow(InvalidReferenceError);
+
+  const refund = referencedTransaction();
+
+  expect(() => refund.ledgerDirectionFor(
+    processedReference({ id: refund.id }),
+  )).toThrow(InvalidReferenceError);
 });
