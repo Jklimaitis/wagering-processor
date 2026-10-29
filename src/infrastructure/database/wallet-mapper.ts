@@ -4,7 +4,7 @@ import { WalletRecord } from './wallet-record';
 
 export class WalletMapper {
   static toDomain(record: WalletRecord): Wallet {
-    return Wallet.rehydrate({
+    return Wallet.rehydrate({ // Carteira recuperada precisa preservar a versão
       id: record.id,
       playerId: record.playerId,
       currency: record.currency,
