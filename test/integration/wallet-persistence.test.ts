@@ -20,6 +20,11 @@ import { WalletLedgerEntryRecord } from "../../src/infrastructure/database/walle
 import { LedgerDirection } from "../../src/domain/wallet-ledger-entry";
 import { fileURLToPath } from "node:url";
 import type { WagerWorkerOutput } from "../helpers/wager-worker";
+import { OutboxMessage } from "../../src/domain/outbox-message";
+import { WagerTransactionProcessed } from "../../src/domain/wager-transaction-events";
+import { WagerTransactionMapper } from "../../src/infrastructure/database/wager-transaction-mapper";
+import { OutboxMessageMapper } from "../../src/infrastructure/database/outbox-message-mapper";
+import { OutboxMessageRecord } from "../../src/infrastructure/database/outbox-message-record";
 
 const schema = `wallet_persistence_${crypto.randomUUID().replaceAll("-", "")}`;
 
@@ -864,3 +869,350 @@ test("mesma chave concorrente em wallets distintas gera um conflito", async () =
     await expectLedgerMatchesWallet(wallet.id);
   }
 }, 30_000);
+
+async function outboxForPersistenceTest(): Promise<OutboxMessage> {
+  const wallet = await emptyWalletForWagerTest();
+
+  const props = wagerPropsForTest(wallet, {
+    kind: WagerTransactionKind.Win,
+    money: Money.from({
+      amount: "999999999999999999.99",
+      currency: "BRL",
+    }),
+  });
+
+  const processor = new PostgresWagerProcessor(orm.em.fork({ schema }));
+
+  await processor.process(props);
+
+  const record = await orm.em
+    .fork({ schema })
+    .findOneOrFail(WagerTransactionRecord, { id: props.id });
+
+  const event = WagerTransactionProcessed.from(
+    WagerTransactionMapper.toDomain(record),
+    {
+      eventId: crypto.randomUUID(),
+      correlationId: crypto.randomUUID(),
+      occurredAt: new Date(),
+    },
+  );
+
+  return OutboxMessage.enqueue(event);
+}
+
+test("persiste payload exato e estado de publicação da outbox", async () => {
+  const message = await outboxForPersistenceTest();
+  const now = message.occurredAt;
+
+  message.scheduleRetry(now);
+
+  const writer = orm.em.fork({ schema });
+
+  writer.persist(OutboxMessageMapper.toRecord(message));
+  await writer.flush();
+
+  const reader = orm.em.fork({ schema });
+
+  const loaded = await reader.findOneOrFail(OutboxMessageRecord, {
+    id: message.id,
+  });
+
+  const restored = OutboxMessageMapper.toDomain(loaded);
+
+  expect(restored.payload).toEqual(message.payload);
+  expect(restored.attempts).toBe(1);
+  expect(restored.nextAttemptAt).toEqual(new Date(now.getTime() + 1_000));
+  expect(restored.publishedAt).toBeUndefined();
+
+  expect(restored.payload).toMatchObject({
+    data: {
+      money: {
+        amount: "999999999999999999.99",
+        currency: "BRL",
+      },
+    },
+  });
+
+  const publishedAt = new Date(now.getTime() + 5_000);
+
+  restored.markPublished(publishedAt);
+
+  loaded.publishedAt = restored.publishedAt ?? null;
+  loaded.nextAttemptAt = restored.nextAttemptAt ?? null;
+
+  await reader.flush();
+
+  const published = await orm.em
+    .fork({ schema })
+    .findOneOrFail(OutboxMessageRecord, { id: message.id });
+
+  expect(published.publishedAt).toEqual(publishedAt);
+  expect(published.nextAttemptAt).toBeNull();
+  expect(published.attempts).toBe(1);
+});
+
+test.each([
+  {
+    assignment: "attempts = -1",
+    constraint: "outbox_messages_attempts_nonnegative",
+  },
+  {
+    assignment: "payload = '{}'::jsonb",
+    constraint: "outbox_messages_payload_envelope",
+  },
+  {
+    assignment: "published_at = now(), next_attempt_at = now()",
+    constraint: "outbox_messages_published_schedule_consistent",
+  },
+])("protege as constraints da outbox: %j", async (scenario) => {
+  const message = await outboxForPersistenceTest();
+  const writer = orm.em.fork({ schema });
+
+  writer.persist(OutboxMessageMapper.toRecord(message));
+  await writer.flush();
+
+  await expect(
+    writer.execute(
+      `
+      update "${schema}".outbox_messages
+      set ${scenario.assignment}
+      where id = ?
+    `,
+      [message.id],
+    ),
+  ).rejects.toMatchObject({
+    code: "23514",
+    constraint: scenario.constraint,
+  });
+});
+
+test("reverte a outbox preservando a operação financeira", async () => {
+  const message = await outboxForPersistenceTest();
+  const writer = orm.em.fork({ schema });
+
+  writer.persist(OutboxMessageMapper.toRecord(message));
+  await writer.flush();
+
+  await orm.migrator.down({
+    schema,
+    to: "Migration20261029000300",
+  });
+
+  const reader = orm.em.fork({ schema });
+
+  const removed = await reader.execute<{ name: string | null }[]>(
+    "select to_regclass(?)::text as name",
+    [`${schema}.outbox_messages`],
+  );
+
+  expect(removed[0]?.name).toBeNull();
+
+  const transaction = await reader.findOneOrFail(WagerTransactionRecord, {
+    id: message.aggregateId,
+  });
+
+  const wallet = await reader.findOneOrFail(WalletRecord, {
+    id: transaction.walletId,
+  });
+
+  expect(wallet.balance).toBe("999999999999999999.99");
+
+  expect(
+    await reader.count(WalletLedgerEntryRecord, {
+      transactionId: transaction.id,
+    }),
+  ).toBe(1);
+
+  await orm.migrator.up({ schema });
+
+  const restored = await reader.execute<{ name: string | null }[]>(
+    "select to_regclass(?)::text as name",
+    [`${schema}.outbox_messages`],
+  );
+
+  expect(typeof restored[0]?.name).toBe("string");
+}, 30_000);
+
+async function outboxEventsForTransaction(transactionId: string) {
+  return orm.em.fork({ schema }).execute<
+    {
+      id: string;
+      event_type: string;
+      payload: Record<string, unknown>;
+    }[]
+  >(
+    `
+      select id, event_type, payload
+      from "${schema}".outbox_messages
+      where payload -> 'data' ->> 'transactionId' = ?
+      order by id
+    `,
+    [transactionId],
+  );
+}
+
+test("grava os eventos financeiros e os preserva no replay", async () => {
+  const wallet = await emptyWalletForWagerTest();
+
+  const processor = new PostgresWagerProcessor(orm.em.fork({ schema }));
+
+  await processor.process(
+    wagerPropsForTest(wallet, {
+      kind: WagerTransactionKind.Win,
+      money: Money.from({
+        amount: "100.00",
+        currency: "BRL",
+      }),
+    }),
+  );
+
+  const bet = wagerPropsForTest(wallet);
+
+  await processor.process(bet, undefined, {
+    correlationId: "request-original",
+    causationId: "message-original",
+  });
+
+  const events = await outboxEventsForTransaction(bet.id);
+
+  expect(events).toHaveLength(2);
+
+  expect(events.map((event) => event.event_type).sort()).toEqual([
+    "WagerTransactionProcessed",
+    "WalletBalanceChanged",
+  ]);
+
+  for (const event of events) {
+    expect(event.payload).toMatchObject({
+      correlationId: "request-original",
+      causationId: "message-original",
+      data: { transactionId: bet.id },
+    });
+  }
+
+  const replay = await processor.process(
+    { ...bet, id: crypto.randomUUID() },
+    undefined,
+    { correlationId: "request-retry" },
+  );
+
+  expect(replay.idempotentReplay).toBe(true);
+
+  expect(await outboxEventsForTransaction(bet.id)).toEqual(events);
+
+  await expectLedgerMatchesWallet(wallet.id);
+});
+
+test.each([
+  {
+    kind: WagerTransactionKind.Loss,
+    amount: "0.00",
+    status: WagerTransactionStatus.Processed,
+    eventType: "WagerTransactionProcessed",
+  },
+  {
+    kind: WagerTransactionKind.Bet,
+    amount: "25.00",
+    status: WagerTransactionStatus.Rejected,
+    eventType: "WagerTransactionRejected",
+  },
+])(
+  "operação sem movimentação gera somente seu resultado: %j",
+  async (scenario) => {
+    const wallet = await emptyWalletForWagerTest();
+
+    const processor = new PostgresWagerProcessor(orm.em.fork({ schema }));
+
+    const props = wagerPropsForTest(wallet, {
+      kind: scenario.kind,
+      money: Money.from({
+        amount: scenario.amount,
+        currency: "BRL",
+      }),
+    });
+
+    const result = await processor.process(props);
+    const events = await outboxEventsForTransaction(props.id);
+
+    expect(result.status).toBe(scenario.status);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.event_type).toBe(scenario.eventType);
+
+    const reader = orm.em.fork({ schema });
+
+    const storedWallet = await reader.findOneOrFail(WalletRecord, {
+      id: wallet.id,
+    });
+
+    expect(storedWallet.balance).toBe("0.00");
+    expect(storedWallet.version).toBe(1);
+
+    expect(
+      await reader.count(WalletLedgerEntryRecord, { walletId: wallet.id }),
+    ).toBe(0);
+
+    await expectLedgerMatchesWallet(wallet.id);
+  },
+);
+
+test("falha na outbox desfaz a operação financeira", async () => {
+  const wallet = await emptyWalletForWagerTest();
+
+  const processor = new PostgresWagerProcessor(orm.em.fork({ schema }));
+
+  const funding = wagerPropsForTest(wallet, {
+    kind: WagerTransactionKind.Win,
+    money: Money.from({
+      amount: "100.00",
+      currency: "BRL",
+    }),
+  });
+
+  await processor.process(funding);
+
+  const bet = wagerPropsForTest(wallet);
+  const control = orm.em.fork({ schema });
+
+  // O ID foi gerado pelo próprio teste com crypto.randomUUID().
+  await control.execute(`
+    alter table "${schema}".outbox_messages
+    add constraint outbox_test_failure
+    check (aggregate_id <> '${bet.id}'::uuid)
+  `);
+
+  try {
+    await expect(processor.process(bet)).rejects.toMatchObject({
+      code: "23514",
+      constraint: "outbox_test_failure",
+    });
+  } finally {
+    await control.execute(`
+      alter table "${schema}".outbox_messages
+      drop constraint outbox_test_failure
+    `);
+  }
+
+  const reader = orm.em.fork({ schema });
+
+  const storedWallet = await reader.findOneOrFail(WalletRecord, {
+    id: wallet.id,
+  });
+
+  expect(storedWallet.balance).toBe("100.00");
+  expect(storedWallet.version).toBe(2);
+
+  expect(
+    await reader.findOne(WagerTransactionRecord, { id: bet.id }),
+  ).toBeNull();
+
+  expect(
+    await reader.count(WalletLedgerEntryRecord, { transactionId: bet.id }),
+  ).toBe(0);
+
+  expect(await outboxEventsForTransaction(bet.id)).toHaveLength(0);
+
+  expect(await outboxEventsForTransaction(funding.id)).toHaveLength(2);
+
+  await expectLedgerMatchesWallet(wallet.id);
+});

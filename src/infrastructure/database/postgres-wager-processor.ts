@@ -22,11 +22,28 @@ import { WalletMapper } from "./wallet-mapper";
 import { WagerTransactionRecord } from "./wager-transaction-record";
 import { WagerTransactionMapper } from "./wager-transaction-mapper";
 import { WalletLedgerEntryMapper } from "./wallet-ledger-entry-mapper";
+import type {
+  EventContext,
+  IntegrationEvent,
+} from "../../domain/integration-event";
+import { OutboxMessage } from "../../domain/outbox-message";
+import { WalletBalanceChanged } from "../../domain/wallet-balance-changed";
+import {
+  WagerTransactionPendingReference,
+  WagerTransactionProcessed,
+  WagerTransactionRejected,
+} from "../../domain/wager-transaction-events";
+import { OutboxMessageMapper } from "./outbox-message-mapper";
 
 export type ProcessWagerProps = Omit<
   CreateWagerTransactionProps,
   "payloadHash"
 >;
+
+export interface WagerProcessingContext {
+  correlationId: string;
+  causationId?: string;
+}
 
 export interface PostgresWagerResult {
   transactionId: string;
@@ -53,6 +70,9 @@ export class PostgresWagerProcessor {
   async process(
     props: ProcessWagerProps,
     entryId: string = crypto.randomUUID(),
+    context: WagerProcessingContext = {
+      correlationId: crypto.randomUUID(),
+    },
   ): Promise<PostgresWagerResult> {
     const payloadHash = hashWagerPayload(props);
 
@@ -115,12 +135,15 @@ export class PostgresWagerProcessor {
               status: WagerTransactionStatus.Processed,
             })) > 0;
 
+          const at = new Date();
+
           const entry = this.domainProcessor.process({
             transaction,
             wallet,
             entryId,
             reference,
             reversalAlreadyProcessed,
+            at,
           });
 
           walletRecord.balance = wallet.balance.toString();
@@ -137,6 +160,29 @@ export class PostgresWagerProcessor {
 
           if (entry !== undefined) {
             em.persist(WalletLedgerEntryMapper.toRecord(entry));
+          }
+
+          const events: IntegrationEvent<unknown>[] = [
+            this.createOutcomeEvent(
+              transaction,
+              this.eventContext(context, at),
+            ),
+          ];
+
+          if (entry !== undefined) {
+            events.push(
+              WalletBalanceChanged.from(
+                wallet,
+                entry,
+                this.eventContext(context, at),
+              ),
+            );
+          }
+
+          for (const event of events) {
+            em.persist(
+              OutboxMessageMapper.toRecord(OutboxMessage.enqueue(event)),
+            );
           }
 
           return this.toResult(transactionRecord, false);
@@ -158,6 +204,37 @@ export class PostgresWagerProcessor {
       }
 
       return replay;
+    }
+  }
+
+  private eventContext(
+    context: WagerProcessingContext,
+    at: Date,
+  ): EventContext {
+    return {
+      eventId: crypto.randomUUID(),
+      correlationId: context.correlationId,
+      causationId: context.causationId,
+      occurredAt: at,
+    };
+  }
+
+  private createOutcomeEvent(
+    transaction: WagerTransaction,
+    context: EventContext,
+  ): IntegrationEvent<unknown> {
+    switch (transaction.status) {
+      case WagerTransactionStatus.Processed:
+        return WagerTransactionProcessed.from(transaction, context);
+
+      case WagerTransactionStatus.Rejected:
+        return WagerTransactionRejected.from(transaction, context);
+
+      case WagerTransactionStatus.PendingReference:
+        return WagerTransactionPendingReference.from(transaction, context);
+
+      default:
+        throw new Error("O processamento terminou em um estado sem evento.");
     }
   }
 

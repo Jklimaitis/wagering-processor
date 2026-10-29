@@ -3,6 +3,7 @@ import { Migrator } from '@mikro-orm/migrations';
 import { WalletSchema } from './wallet-record';
 import { WagerTransactionSchema } from './wager-transaction-schema';
 import { WalletLedgerEntrySchema } from './wallet-ledger-entry-schema';
+import { OutboxMessageSchema } from './outbox-message-record';
 
 const clientUrl = process.env.DATABASE_URL;
 
@@ -14,7 +15,7 @@ export default defineConfig({
   clientUrl,
   schema: 'public',
 
-  entities: [WalletSchema, WagerTransactionSchema, WalletLedgerEntrySchema],
+  entities: [WalletSchema, WagerTransactionSchema, WalletLedgerEntrySchema, OutboxMessageSchema],
 
   extensions: [Migrator],
 
