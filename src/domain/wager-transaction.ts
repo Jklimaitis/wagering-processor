@@ -11,11 +11,11 @@ export enum WagerTransactionKind {
 }
 
 export enum WagerTransactionStatus {
-  Pending = "PENDING",
-  PendingReference = "PENDING_REFERENCE",
-  Processed = "PROCESSED",
-  Rejected = "REJECTED",
-  Failed = "FAILED",
+  Pending = "PENDING", // transação aceita, mas ainda não aplicada
+  PendingReference = "PENDING_REFERENCE", // aguardando transação referenciada
+  Processed = "PROCESSED", // aplicada (terminal)
+  Rejected = "REJECTED", // violação da regra de negocio(terminal)
+  Failed = "FAILED", // erro permanente de infra ( terminal, auditável)
 }
 
 export interface CreateWagerTransactionProps {
@@ -95,7 +95,7 @@ export class WagerTransaction {
   public readonly gameId: string;
   public readonly kind: WagerTransactionKind;
   public readonly money: Money;
-  public readonly referenceExternalTransactionId: string | undefined;
+  public readonly referenceExternalTransactionId: string | undefined; // id no provedor - não id interno
   public readonly createdAt: Date;
 
   private _status: WagerTransactionStatus;
@@ -286,7 +286,7 @@ export class WagerTransaction {
   get status(): WagerTransactionStatus {
     return this._status;
   }
-
+// -- consultas de dominio --
   isTerminal(): boolean {
     return (
       this._status === WagerTransactionStatus.Processed ||
@@ -296,13 +296,13 @@ export class WagerTransaction {
   }
 
   affectsBalance(): boolean {
-    return this.kind !== WagerTransactionKind.Loss;
+    return this.kind !== WagerTransactionKind.Loss; // false para LOSS
   }
 
   requiresReference(): boolean {
     return (
       this.kind === WagerTransactionKind.Refund ||
-      this.kind === WagerTransactionKind.Rollback
+      this.kind === WagerTransactionKind.Rollback // true para REFUND e ROLLBACK
     );
   }
 
