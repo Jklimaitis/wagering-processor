@@ -1,0 +1,287 @@
+import { Money } from "./money";
+
+export enum WagerTransactionKind {
+  Opening = "OPENING",
+  Bet = "BET",
+  Win = "WIN",
+  Loss = "LOSS",
+  Refund = "REFUND",
+  Rollback = "ROLLBACK",
+}
+
+export enum WagerTransactionStatus {
+  Pending = "PENDING",
+  PendingReference = "PENDING_REFERENCE",
+  Processed = "PROCESSED",
+  Rejected = "REJECTED",
+  Failed = "FAILED",
+}
+
+export interface CreateWagerTransactionProps {
+  id: string;
+  providerId: string;
+  externalTransactionId: string;
+  idempotencyKey: string;
+  payloadHash: string;
+  walletId: string;
+  playerId: string;
+  roundId: string;
+  gameId: string;
+  kind: WagerTransactionKind;
+  money: Money;
+  referenceExternalTransactionId?: string;
+}
+
+export interface WagerTransactionState extends CreateWagerTransactionProps {
+  status: WagerTransactionStatus;
+  createdAt: Date;
+  referenceTransactionId?: string;
+  failureCode?: FailureCode;
+  processedAt?: Date;
+}
+
+export class InvalidWagerTransactionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidWagerTransactionError";
+  }
+}
+
+// Incluindo taxonomia para facil identificação
+export enum FailureCode {
+  InsufficientBalance = "INSUFFICIENT_BALANCE",
+  InsufficientBalanceForReversal = "INSUFFICIENT_BALANCE_FOR_REVERSAL",
+  ReferenceNotFound = "REFERENCE_NOT_FOUND",
+  InvalidReference = "INVALID_REFERENCE",
+  AlreadyReversed = "ALREADY_REVERSED",
+  PermanentInfrastructureError = "PERMANENT_INFRASTRUCTURE_ERROR",
+}
+
+export class InvalidTransactionStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidTransactionStateError";
+  }
+}
+
+export class WagerTransaction {
+  public readonly id: string;
+  public readonly providerId: string;
+  public readonly externalTransactionId: string;
+  public readonly idempotencyKey: string;
+  public readonly payloadHash: string;
+  public readonly walletId: string;
+  public readonly playerId: string;
+  public readonly roundId: string;
+  public readonly gameId: string;
+  public readonly kind: WagerTransactionKind;
+  public readonly money: Money;
+  public readonly referenceExternalTransactionId: string | undefined;
+  public readonly createdAt: Date;
+
+  private _status: WagerTransactionStatus;
+  private _referenceTransactionId: string | undefined;
+  private _failureCode: FailureCode | undefined;
+  private _processedAt: Date | undefined;
+
+  private constructor(state: WagerTransactionState) {
+    this.id = state.id;
+    this.providerId = state.providerId;
+    this.externalTransactionId = state.externalTransactionId;
+    this.idempotencyKey = state.idempotencyKey;
+    this.payloadHash = state.payloadHash;
+    this.walletId = state.walletId;
+    this.playerId = state.playerId;
+    this.roundId = state.roundId;
+    this.gameId = state.gameId;
+    this.kind = state.kind;
+    this.money = state.money;
+    this.referenceExternalTransactionId = state.referenceExternalTransactionId;
+    this.createdAt = state.createdAt;
+    this._status = state.status;
+    this._referenceTransactionId = state.referenceTransactionId;
+    this._failureCode = state.failureCode;
+    this._processedAt =
+      state.processedAt === undefined
+        ? undefined
+        : new Date(state.processedAt.getTime());
+  }
+
+  static create(
+    props: CreateWagerTransactionProps,
+    at: Date = new Date(),
+  ): WagerTransaction {
+    const identifiers = [
+      props.id,
+      props.providerId,
+      props.externalTransactionId,
+      props.idempotencyKey,
+      props.payloadHash,
+      props.walletId,
+      props.playerId,
+      props.roundId,
+      props.gameId,
+    ];
+
+    if (identifiers.some((value) => value.trim() === "")) {
+      throw new InvalidWagerTransactionError(
+        "Os identificadores e o hash são obrigatórios.",
+      );
+    }
+
+    if (!Object.values(WagerTransactionKind).includes(props.kind)) {
+      throw new InvalidWagerTransactionError("Tipo de operação inválido.");
+    }
+
+    if (
+      props.referenceExternalTransactionId !== undefined &&
+      props.referenceExternalTransactionId.trim() === ""
+    ) {
+      throw new InvalidWagerTransactionError(
+        "A referência informada não pode ser vazia.",
+      );
+    }
+
+    const transaction = new WagerTransaction({
+      ...props,
+      status: WagerTransactionStatus.Pending,
+      createdAt: at,
+    });
+
+    if (
+      transaction.requiresReference() &&
+      props.referenceExternalTransactionId === undefined
+    ) {
+      throw new InvalidWagerTransactionError(
+        "REFUND e ROLLBACK exigem uma referência.",
+      );
+    }
+
+    if (
+      props.money.isNegative() ||
+      (transaction.affectsBalance() && !props.money.isPositive())
+    ) {
+      throw new InvalidWagerTransactionError(
+        "Operações financeiras exigem valor positivo; LOSS aceita zero.",
+      );
+    }
+
+    return transaction;
+  }
+
+  static rehydrate(state: WagerTransactionState): WagerTransaction {
+    return new WagerTransaction(state);
+  }
+
+  get status(): WagerTransactionStatus {
+    return this._status;
+  }
+
+  isTerminal(): boolean {
+    return (
+      this._status === WagerTransactionStatus.Processed ||
+      this._status === WagerTransactionStatus.Rejected ||
+      this._status === WagerTransactionStatus.Failed
+    );
+  }
+
+  affectsBalance(): boolean {
+    return this.kind !== WagerTransactionKind.Loss;
+  }
+
+  requiresReference(): boolean {
+    return (
+      this.kind === WagerTransactionKind.Refund ||
+      this.kind === WagerTransactionKind.Rollback
+    );
+  }
+
+  matchesPayload(payloadHash: string): boolean {
+    return this.payloadHash === payloadHash;
+  }
+
+  get referenceTransactionId(): string | undefined {
+    return this._referenceTransactionId;
+  }
+
+  get failureCode(): FailureCode | undefined {
+    return this._failureCode;
+  }
+
+  get processedAt(): Date | undefined {
+    return this._processedAt === undefined
+      ? undefined
+      : new Date(this._processedAt.getTime());
+  }
+
+  markPendingReference(): void {
+    this.assertNotTerminal();
+
+    if (this._status !== WagerTransactionStatus.Pending) {
+      throw new InvalidTransactionStateError(
+        "Somente PENDING pode passar para PENDING_REFERENCE.",
+      );
+    }
+
+    if (this.referenceExternalTransactionId === undefined) {
+      throw new InvalidWagerTransactionError(
+        "Não é possível aguardar uma referência não informada.",
+      );
+    }
+
+    this._status = WagerTransactionStatus.PendingReference;
+  }
+
+  markProcessed(
+    referenceTransactionId: string | undefined,
+    at: Date = new Date(),
+  ): void {
+    this.assertNotTerminal();
+
+    if (
+      referenceTransactionId !== undefined &&
+      referenceTransactionId.trim() === ""
+    ) {
+      throw new InvalidWagerTransactionError(
+        "O identificador interno da referência não pode ser vazio.",
+      );
+    }
+
+    const hasExternalReference =
+      this.referenceExternalTransactionId !== undefined;
+
+    const hasInternalReference = referenceTransactionId !== undefined;
+
+    if (hasExternalReference !== hasInternalReference) {
+      throw new InvalidWagerTransactionError(
+        "A referência externa deve corresponder a uma referência interna.",
+      );
+    }
+
+    this._referenceTransactionId = referenceTransactionId;
+    this._processedAt = new Date(at.getTime());
+    this._status = WagerTransactionStatus.Processed;
+  }
+
+  reject(code: FailureCode): void {
+    this.assertNotTerminal();
+
+    this._failureCode = code;
+    this._status = WagerTransactionStatus.Rejected;
+  }
+
+  fail(code: FailureCode): void {
+    this.assertNotTerminal();
+
+    this._failureCode = code;
+    this._status = WagerTransactionStatus.Failed;
+  }
+
+  private assertNotTerminal(): void {
+    if (this.isTerminal()) {
+      throw new InvalidTransactionStateError(
+        `A transação em ${this._status} não pode mudar de estado.`,
+      );
+    }
+  }
+}
