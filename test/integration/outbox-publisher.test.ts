@@ -22,6 +22,9 @@ import {
 } from "@aws-sdk/client-sqs";
 import { createSqsClient } from "../../src/infrastructure/messaging/sqs-client";
 import { SqsEventPublisher } from "../../src/infrastructure/messaging/sqs-event-publisher";
+import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
+import { LockMode } from "@mikro-orm/core";
 
 const schema = `outbox_publisher_${crypto.randomUUID().replaceAll("-", "")}`;
 
@@ -609,3 +612,211 @@ test("dois publishers concorrentes publicam eventos distintos no SQS", async () 
     expect((await firstPublisher.publishNext()).status).toBe("IDLE");
   });
 }, 20_000);
+
+function startOutboxWorker(queueUrl: string) {
+  const queueName = new URL(queueUrl).pathname.split("/").at(-1);
+
+  if (!queueName) {
+    throw new Error("URL da fila de teste inválida.");
+  }
+
+  const workerPath = fileURLToPath(
+    new URL("../../src/workers/outbox-worker.ts", import.meta.url),
+  );
+
+  const worker = Bun.spawn([process.execPath, workerPath], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      DATABASE_SCHEMA: schema,
+      SQS_EVENTS_QUEUE_NAME: queueName,
+    },
+    timeout: 15_000,
+    killSignal: "SIGKILL",
+  });
+
+  let output = "";
+
+  const stdout = (async () => {
+    const reader = worker.stdout.getReader();
+    const decoder = new TextDecoder();
+
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+
+        if (chunk.done) {
+          break;
+        }
+
+        output += decoder.decode(chunk.value, { stream: true });
+      }
+
+      output += decoder.decode();
+      return output;
+    } finally {
+      reader.releaseLock();
+    }
+  })();
+
+  return {
+    worker,
+    stdout,
+    stderr: new Response(worker.stderr).text(),
+    output: () => output,
+  };
+}
+
+type OutboxWorkerHandle = ReturnType<typeof startOutboxWorker>;
+
+async function waitForWorkerEvent(
+  handle: OutboxWorkerHandle,
+  event: string,
+): Promise<void> {
+  await withDeadline(
+    (async () => {
+      while (!handle.output().includes(`"event":"${event}"`)) {
+        if (
+          handle.worker.exitCode !== null ||
+          handle.worker.signalCode !== null
+        ) {
+          throw new Error(
+            `Worker encerrou antes de ${event}: ` +
+              `${handle.output()} ${await handle.stderr}`,
+          );
+        }
+
+        await delay(20);
+      }
+    })(),
+  );
+}
+
+async function cleanupOutboxWorker(handle: OutboxWorkerHandle): Promise<void> {
+  if (handle.worker.exitCode === null && handle.worker.signalCode === null) {
+    handle.worker.kill("SIGKILL");
+  }
+
+  await Promise.allSettled([
+    handle.worker.exited,
+    handle.stdout,
+    handle.stderr,
+  ]);
+}
+
+test("worker real encerra normalmente ao receber SIGTERM", async () => {
+  await withSqsQueue(async (_client, queueUrl) => {
+    const handle = startOutboxWorker(queueUrl);
+
+    try {
+      await waitForWorkerEvent(handle, "outbox_worker_ready");
+
+      expect(handle.worker.pid).not.toBe(process.pid);
+      expect(handle.worker.exitCode).toBeNull();
+
+      handle.worker.kill("SIGTERM");
+
+      expect(await withDeadline(handle.worker.exited)).toBe(0);
+
+      const output = await handle.stdout;
+
+      expect(output).toContain('"event":"outbox_worker_stopping"');
+      expect(output).toContain('"event":"outbox_worker_stopped"');
+      expect(output).not.toContain('"event":"outbox_worker_failed"');
+    } finally {
+      await cleanupOutboxWorker(handle);
+    }
+  });
+}, 20_000);
+
+test("novo worker publica evento confirmado antes da queda do anterior", async () => {
+  await withSqsQueue(async (client, queueUrl) => {
+    const record = await seedOutbox();
+
+    const firstPid = await orm.em.fork({ schema }).transactional(async (em) => {
+      await em.findOneOrFail(
+        OutboxMessageRecord,
+        { id: record.id },
+        { lockMode: LockMode.PESSIMISTIC_WRITE },
+      );
+
+      const first = startOutboxWorker(queueUrl);
+
+      try {
+        await waitForWorkerEvent(first, "outbox_worker_ready");
+
+        first.worker.kill("SIGKILL");
+        await withDeadline(first.worker.exited);
+
+        expect(first.worker.signalCode).toBe("SIGKILL");
+        expect(await first.stdout).not.toContain(
+          '"event":"outbox_event_published"',
+        );
+
+        return first.worker.pid;
+      } finally {
+        await cleanupOutboxWorker(first);
+      }
+    });
+
+    const pending = await orm.em
+      .fork({ schema })
+      .findOneOrFail(OutboxMessageRecord, { id: record.id });
+
+    expect(pending.publishedAt).toBeNull();
+    expect(pending.payload).toEqual(record.payload);
+
+    const second = startOutboxWorker(queueUrl);
+
+    try {
+      await waitForWorkerEvent(second, "outbox_event_published");
+
+      expect(second.worker.pid).not.toBe(firstPid);
+
+      const published = await orm.em
+        .fork({ schema })
+        .findOneOrFail(OutboxMessageRecord, { id: record.id });
+
+      expect(published.publishedAt).not.toBeNull();
+      expect(published.payload).toEqual(record.payload);
+
+      const received = await client.send(
+        new ReceiveMessageCommand({
+          QueueUrl: queueUrl,
+          MaxNumberOfMessages: 1,
+          WaitTimeSeconds: 2,
+          MessageSystemAttributeNames: ["MessageDeduplicationId"],
+        }),
+      );
+
+      const message = received.Messages?.[0];
+
+      if (
+        message === undefined ||
+        message.Body === undefined ||
+        message.ReceiptHandle === undefined
+      ) {
+        throw new Error("Evento não foi recebido após reiniciar o worker.");
+      }
+
+      expect(JSON.parse(message.Body)).toEqual(record.payload);
+      expect(message.Attributes?.MessageDeduplicationId).toBe(record.id);
+
+      await client.send(
+        new DeleteMessageCommand({
+          QueueUrl: queueUrl,
+          ReceiptHandle: message.ReceiptHandle,
+        }),
+      );
+
+      second.worker.kill("SIGTERM");
+
+      expect(await withDeadline(second.worker.exited)).toBe(0);
+      expect(await second.stdout).toContain('"event":"outbox_worker_stopped"');
+    } finally {
+      await cleanupOutboxWorker(second);
+    }
+  });
+}, 30_000);

@@ -14,7 +14,7 @@ if (!clientUrl) {
 
 export default defineConfig({
   clientUrl,
-  schema: 'public',
+  schema: process.env.DATABASE_SCHEMA ?? 'public',
 
   entities: [WalletSchema, WagerTransactionSchema, WalletLedgerEntrySchema, OutboxMessageSchema, InboxMessageSchema],
 

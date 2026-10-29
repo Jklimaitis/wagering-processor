@@ -22,3 +22,19 @@ export function createSqsClient(): SQSClient {
     maxAttempts: 1,
   });
 }
+
+export function getSqsEventsQueueName(): string {
+  const name = requiredEnvironment("SQS_EVENTS_QUEUE_NAME");
+
+  if (
+    !name.endsWith(".fifo") ||
+    name === process.env.SQS_QUEUE_NAME ||
+    name === process.env.SQS_DLQ_NAME
+  ) {
+    throw new Error(
+      "SQS_EVENTS_QUEUE_NAME deve identificar uma fila FIFO separada.",
+    );
+  }
+
+  return name;
+}
