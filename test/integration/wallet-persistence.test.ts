@@ -6,6 +6,7 @@ import config from "../../src/infrastructure/database/mikro-orm.config";
 import { WalletMapper } from "../../src/infrastructure/database/wallet-mapper";
 import { WalletRecord } from "../../src/infrastructure/database/wallet-record";
 import {
+  FailureCode,
   WagerTransactionKind,
   WagerTransactionStatus,
 } from "../../src/domain/wager-transaction";
@@ -16,6 +17,9 @@ import {
 } from "../../src/infrastructure/database/postgres-wager-processor";
 import { WagerTransactionRecord } from "../../src/infrastructure/database/wager-transaction-record";
 import { WalletLedgerEntryRecord } from "../../src/infrastructure/database/wallet-ledger-entry-record";
+import { LedgerDirection } from "../../src/domain/wallet-ledger-entry";
+import { fileURLToPath } from "node:url";
+import type { WagerWorkerOutput } from "../helpers/wager-worker";
 
 const schema = `wallet_persistence_${crypto.randomUUID().replaceAll("-", "")}`;
 
@@ -198,7 +202,7 @@ test("persiste aposta, saldo e ledger no mesmo processamento", async () => {
 
   expect(storedEntry.transactionId).toBe(bet.id);
   expect(storedEntry.walletId).toBe(wallet.id);
-  expect(storedEntry.direction).toBe("DEBIT");
+  expect(storedEntry.direction).toBe(LedgerDirection.Debit);
   expect(storedEntry.amount).toBe("25.00");
   expect(storedEntry.balanceBefore).toBe("100.00");
   expect(storedEntry.balanceAfter).toBe("75.00");
@@ -360,3 +364,503 @@ test("mesma chave com valor diferente gera conflito sem novo débito", async () 
     await reader.count(WalletLedgerEntryRecord, { walletId: wallet.id }),
   ).toBe(2);
 });
+
+async function expectLedgerMatchesWallet(walletId: string): Promise<void> {
+  const reader = orm.em.fork({ schema });
+
+  const wallet = await reader.findOneOrFail(WalletRecord, { id: walletId });
+
+  const rows = await reader.execute<{ balance: string }[]>(
+    `
+      select coalesce(
+        sum(
+          case
+            when direction = 'CREDIT' then amount
+            else -amount
+          end
+        ),
+        0
+      )::numeric(20, 2)::text as balance
+      from "${schema}".wallet_ledger_entries
+      where wallet_id = ?
+    `,
+    [walletId],
+  );
+
+  expect(rows[0]?.balance).toBe(wallet.balance);
+}
+
+test("50 envios paralelos da mesma aposta produzem um único débito", async () => {
+  const wallet = await emptyWalletForWagerTest();
+
+  const processor = new PostgresWagerProcessor(orm.em.fork({ schema }));
+
+  await processor.process(
+    wagerPropsForTest(wallet, {
+      kind: WagerTransactionKind.Win,
+      money: Money.from({
+        amount: "100.00",
+        currency: "BRL",
+      }),
+    }),
+  );
+
+  const bet = wagerPropsForTest(wallet);
+
+  const attempts = await Promise.allSettled(
+    Array.from({ length: 50 }, () => {
+      const instance = new PostgresWagerProcessor(orm.em.fork({ schema }));
+
+      return instance.process({
+        ...bet,
+        id: crypto.randomUUID(),
+      });
+    }),
+  );
+
+  expect(attempts.filter((attempt) => attempt.status === "rejected")).toEqual(
+    [],
+  );
+
+  const results = attempts.flatMap((attempt) =>
+    attempt.status === "fulfilled" ? [attempt.value] : [],
+  );
+
+  expect(results).toHaveLength(50);
+
+  expect(results.filter((result) => !result.idempotentReplay)).toHaveLength(1);
+
+  expect(results.filter((result) => result.idempotentReplay)).toHaveLength(49);
+
+  expect(new Set(results.map((result) => result.transactionId)).size).toBe(1);
+
+  expect(
+    results.every(
+      (result) =>
+        result.status === WagerTransactionStatus.Processed &&
+        result.balance.amount === "75.00" &&
+        result.balance.currency === "BRL",
+    ),
+  ).toBe(true);
+
+  const reader = orm.em.fork({ schema });
+
+  const storedWallet = await reader.findOneOrFail(WalletRecord, {
+    id: wallet.id,
+  });
+
+  expect(storedWallet.balance).toBe("75.00");
+  expect(storedWallet.version).toBe(3);
+
+  expect(
+    await reader.count(WagerTransactionRecord, {
+      providerId: bet.providerId,
+      externalTransactionId: bet.externalTransactionId,
+    }),
+  ).toBe(1);
+
+  expect(
+    await reader.count(WalletLedgerEntryRecord, {
+      walletId: wallet.id,
+      direction: LedgerDirection.Debit,
+    }),
+  ).toBe(1);
+
+  await expectLedgerMatchesWallet(wallet.id);
+}, 30_000);
+
+test("duas apostas paralelas de 80 disputam saldo de 100", async () => {
+  const wallet = await emptyWalletForWagerTest();
+
+  const processor = new PostgresWagerProcessor(orm.em.fork({ schema }));
+
+  await processor.process(
+    wagerPropsForTest(wallet, {
+      kind: WagerTransactionKind.Win,
+      money: Money.from({
+        amount: "100.00",
+        currency: "BRL",
+      }),
+    }),
+  );
+
+  const bets = Array.from({ length: 2 }, () =>
+    wagerPropsForTest(wallet, {
+      money: Money.from({
+        amount: "80.00",
+        currency: "BRL",
+      }),
+    }),
+  );
+
+  const attempts = await Promise.allSettled(
+    bets.map((bet) => {
+      const instance = new PostgresWagerProcessor(orm.em.fork({ schema }));
+
+      return instance.process(bet);
+    }),
+  );
+
+  expect(attempts.filter((attempt) => attempt.status === "rejected")).toEqual(
+    [],
+  );
+
+  const results = attempts.flatMap((attempt) =>
+    attempt.status === "fulfilled" ? [attempt.value] : [],
+  );
+
+  expect(results).toHaveLength(2);
+
+  expect(
+    results.filter(
+      (result) => result.status === WagerTransactionStatus.Processed,
+    ),
+  ).toHaveLength(1);
+
+  const rejected = results.filter(
+    (result) => result.status === WagerTransactionStatus.Rejected,
+  );
+
+  expect(rejected).toHaveLength(1);
+  expect(rejected[0]?.failureCode).toBe(FailureCode.InsufficientBalance);
+
+  expect(results.every((result) => result.balance.amount === "20.00")).toBe(
+    true,
+  );
+
+  // Reenvia tanto a aposta processada quanto a rejeitada.
+  for (const bet of bets) {
+    const replay = await processor.process({
+      ...bet,
+      id: crypto.randomUUID(),
+    });
+
+    expect(replay.idempotentReplay).toBe(true);
+    expect(replay.balance.amount).toBe("20.00");
+  }
+
+  const reader = orm.em.fork({ schema });
+
+  const storedWallet = await reader.findOneOrFail(WalletRecord, {
+    id: wallet.id,
+  });
+
+  expect(storedWallet.balance).toBe("20.00");
+  expect(storedWallet.version).toBe(3);
+
+  expect(
+    await reader.count(WalletLedgerEntryRecord, {
+      walletId: wallet.id,
+      direction: LedgerDirection.Debit,
+    }),
+  ).toBe(1);
+
+  await expectLedgerMatchesWallet(wallet.id);
+}, 30_000);
+
+function startWagerWorker() {
+  const workerPath = fileURLToPath(
+    new URL("../helpers/wager-worker.ts", import.meta.url),
+  );
+
+  let worker!: Bun.Subprocess<"ignore", "pipe", "pipe">;
+
+  const ready = new Promise<void>((resolve, reject) => {
+    worker = Bun.spawn([process.execPath, workerPath, schema], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 20_000,
+
+      ipc(message: unknown) {
+        if (message === "ready") {
+          resolve();
+        }
+      },
+
+      onExit(_worker, exitCode) {
+        reject(new Error(`Worker encerrou antes da liberação: ${exitCode}`));
+      },
+    });
+  });
+
+  return {
+    worker,
+    ready,
+    stdout: new Response(worker.stdout).text(),
+    stderr: new Response(worker.stderr).text(),
+  };
+}
+
+test("três processos disputam o saldo da mesma wallet", async () => {
+  const wallet = await emptyWalletForWagerTest();
+
+  const processor = new PostgresWagerProcessor(orm.em.fork({ schema }));
+
+  await processor.process(
+    wagerPropsForTest(wallet, {
+      kind: WagerTransactionKind.Win,
+      money: Money.from({
+        amount: "100.00",
+        currency: "BRL",
+      }),
+    }),
+  );
+
+  const workers = Array.from({ length: 3 }, () => startWagerWorker());
+
+  try {
+    // Todos precisam estar conectados antes de liberar as apostas.
+    await Promise.all(workers.map((handle) => handle.ready));
+
+    for (const handle of workers) {
+      const bet = wagerPropsForTest(wallet, {
+        money: Money.from({
+          amount: "80.00",
+          currency: "BRL",
+        }),
+      });
+
+      handle.worker.send(
+        JSON.stringify({
+          ...bet,
+          money: bet.money.toJSON(),
+        }),
+      );
+    }
+
+    const outputs = await Promise.all(
+      workers.map(async (handle) => {
+        const [stdout, stderr, exitCode] = await Promise.all([
+          handle.stdout,
+          handle.stderr,
+          handle.worker.exited,
+        ]);
+
+        if (exitCode !== 0) {
+          throw new Error(`Worker falhou (${exitCode}): ${stderr}`);
+        }
+
+        return JSON.parse(stdout) as WagerWorkerOutput;
+      }),
+    );
+
+    expect(new Set(outputs.map((output) => output.pid)).size).toBe(3);
+
+    const results = outputs.map((output) => output.result);
+
+    expect(
+      results.filter(
+        (result) => result.status === WagerTransactionStatus.Processed,
+      ),
+    ).toHaveLength(1);
+
+    const rejected = results.filter(
+      (result) => result.status === WagerTransactionStatus.Rejected,
+    );
+
+    expect(rejected).toHaveLength(2);
+
+    expect(
+      rejected.every(
+        (result) => result.failureCode === FailureCode.InsufficientBalance,
+      ),
+    ).toBe(true);
+
+    expect(
+      results.every(
+        (result) =>
+          result.balance.amount === "20.00" &&
+          result.balance.currency === "BRL",
+      ),
+    ).toBe(true);
+
+    const reader = orm.em.fork({ schema });
+
+    const storedWallet = await reader.findOneOrFail(WalletRecord, {
+      id: wallet.id,
+    });
+
+    expect(storedWallet.balance).toBe("20.00");
+    expect(storedWallet.version).toBe(3);
+
+    expect(
+      await reader.count(WagerTransactionRecord, {
+        walletId: wallet.id,
+        kind: WagerTransactionKind.Bet,
+      }),
+    ).toBe(3);
+
+    expect(
+      await reader.count(WalletLedgerEntryRecord, {
+        walletId: wallet.id,
+        direction: LedgerDirection.Debit,
+      }),
+    ).toBe(1);
+
+    await expectLedgerMatchesWallet(wallet.id);
+  } finally {
+    for (const handle of workers) {
+      if (
+        handle.worker.exitCode === null &&
+        handle.worker.signalCode === null
+      ) {
+        handle.worker.kill();
+      }
+    }
+
+    await Promise.allSettled(workers.map((handle) => handle.worker.exited));
+  }
+}, 30_000);
+
+test("processa wallets distintas em paralelo preservando seus saldos", async () => {
+  const scenarios = await Promise.all(
+    [
+      { amount: "10.00", expected: "90.00" },
+      { amount: "20.00", expected: "80.00" },
+      { amount: "30.00", expected: "70.00" },
+    ].map(async (scenario) => {
+      const wallet = await emptyWalletForWagerTest();
+
+      const processor = new PostgresWagerProcessor(orm.em.fork({ schema }));
+
+      await processor.process(
+        wagerPropsForTest(wallet, {
+          kind: WagerTransactionKind.Win,
+          money: Money.from({
+            amount: "100.00",
+            currency: "BRL",
+          }),
+        }),
+      );
+
+      return { ...scenario, wallet, processor };
+    }),
+  );
+
+  const attempts = await Promise.allSettled(
+    scenarios.map(async ({ wallet, processor, amount, expected }) => {
+      const result = await processor.process(
+        wagerPropsForTest(wallet, {
+          money: Money.from({
+            amount,
+            currency: "BRL",
+          }),
+        }),
+      );
+
+      return { wallet, expected, result };
+    }),
+  );
+
+  expect(attempts.filter((attempt) => attempt.status === "rejected")).toEqual(
+    [],
+  );
+
+  for (const attempt of attempts) {
+    if (attempt.status !== "fulfilled") {
+      continue;
+    }
+
+    const { wallet, expected, result } = attempt.value;
+
+    expect(result.status).toBe(WagerTransactionStatus.Processed);
+    expect(result.balance.amount).toBe(expected);
+    expect(result.idempotentReplay).toBe(false);
+
+    const reader = orm.em.fork({ schema });
+
+    const storedWallet = await reader.findOneOrFail(WalletRecord, {
+      id: wallet.id,
+    });
+
+    expect(storedWallet.balance).toBe(expected);
+    expect(storedWallet.version).toBe(3);
+
+    expect(
+      await reader.count(WalletLedgerEntryRecord, {
+        walletId: wallet.id,
+        direction: LedgerDirection.Debit,
+      }),
+    ).toBe(1);
+
+    await expectLedgerMatchesWallet(wallet.id);
+  }
+}, 30_000);
+
+test("mesma chave concorrente em wallets distintas gera um conflito", async () => {
+  const wallets = await Promise.all([
+    emptyWalletForWagerTest(),
+    emptyWalletForWagerTest(),
+  ]);
+
+  const processor = new PostgresWagerProcessor(orm.em.fork({ schema }));
+
+  for (const wallet of wallets) {
+    await processor.process(
+      wagerPropsForTest(wallet, {
+        kind: WagerTransactionKind.Win,
+        money: Money.from({
+          amount: "100.00",
+          currency: "BRL",
+        }),
+      }),
+    );
+  }
+
+  const idempotencyKey = `shared:${crypto.randomUUID()}`;
+
+  const attempts = await Promise.allSettled(
+    wallets.map((wallet) =>
+      processor.process(
+        wagerPropsForTest(wallet, {
+          idempotencyKey,
+        }),
+      ),
+    ),
+  );
+
+  const successful = attempts.flatMap((attempt) =>
+    attempt.status === "fulfilled" ? [attempt.value] : [],
+  );
+
+  const errors = attempts.flatMap((attempt) =>
+    attempt.status === "rejected" ? [attempt.reason] : [],
+  );
+
+  expect(successful).toHaveLength(1);
+  expect(successful[0]?.status).toBe(WagerTransactionStatus.Processed);
+  expect(successful[0]?.idempotentReplay).toBe(false);
+
+  expect(errors).toHaveLength(1);
+  expect(errors[0]).toBeInstanceOf(IdempotencyConflictError);
+
+  const reader = orm.em.fork({ schema });
+  const walletIds = wallets.map((wallet) => wallet.id);
+
+  const storedWallets = await reader.find(WalletRecord, {
+    id: { $in: walletIds },
+  });
+
+  expect(storedWallets.map((wallet) => wallet.balance).sort()).toEqual([
+    "100.00",
+    "75.00",
+  ]);
+
+  expect(storedWallets.map((wallet) => wallet.version).sort()).toEqual([2, 3]);
+
+  expect(await reader.count(WagerTransactionRecord, { idempotencyKey })).toBe(
+    1,
+  );
+
+  expect(
+    await reader.count(WalletLedgerEntryRecord, {
+      walletId: { $in: walletIds },
+      direction: LedgerDirection.Debit,
+    }),
+  ).toBe(1);
+
+  for (const wallet of wallets) {
+    await expectLedgerMatchesWallet(wallet.id);
+  }
+}, 30_000);
