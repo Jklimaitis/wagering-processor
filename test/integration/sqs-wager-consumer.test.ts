@@ -12,11 +12,13 @@ import {
   DeleteQueueCommand,
   ReceiveMessageCommand,
   SendMessageCommand,
+  GetQueueAttributesCommand,
 } from "@aws-sdk/client-sqs";
 import { MikroORM } from "@mikro-orm/postgresql";
 import { Money } from "../../src/domain/money";
 import { Wallet } from "../../src/domain/wallet";
 import {
+  FailureCode,
   WagerTransactionKind,
   WagerTransactionStatus,
 } from "../../src/domain/wager-transaction";
@@ -35,6 +37,9 @@ import {
   SqsWagerMessageHandler,
   WAGER_CONSUMER_NAME,
 } from "../../src/infrastructure/messaging/sqs-wager-message-handler";
+import { InvalidInputError } from "../../src/application/input-validation";
+import { SqsWagerFailureHandler } from "../../src/infrastructure/messaging/sqs-wager-failure-handler";
+import { MAX_SQS_ATTEMPTS } from "../../src/infrastructure/messaging/sqs-wager-failure-policy";
 
 const schema = `sqs_consumer_${crypto.randomUUID().replaceAll("-", "")}`;
 const client = createSqsClient();
@@ -42,6 +47,7 @@ const client = createSqsClient();
 let orm: MikroORM;
 let schemaCreated = false;
 let queueUrl: string | undefined;
+let dlqUrl: string | undefined;
 
 beforeAll(async () => {
   orm = await MikroORM.init({
@@ -61,6 +67,37 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   queueUrl = undefined;
+  dlqUrl = undefined;
+
+  const dlq = await client.send(
+    new CreateQueueCommand({
+      QueueName: `consumer-dlq-${crypto.randomUUID()}.fifo`,
+      Attributes: {
+        FifoQueue: "true",
+        ContentBasedDeduplication: "false",
+        MessageRetentionPeriod: "1209600",
+      },
+    }),
+  );
+
+  dlqUrl = dlq.QueueUrl;
+
+  if (dlqUrl === undefined) {
+    throw new Error("SQS não retornou a URL da DLQ de teste.");
+  }
+
+  const attributes = await client.send(
+    new GetQueueAttributesCommand({
+      QueueUrl: dlqUrl,
+      AttributeNames: ["QueueArn"],
+    }),
+  );
+
+  const dlqArn = attributes.Attributes?.QueueArn;
+
+  if (dlqArn === undefined) {
+    throw new Error("SQS não retornou o ARN da DLQ.");
+  }
 
   const created = await client.send(
     new CreateQueueCommand({
@@ -68,6 +105,10 @@ beforeEach(async () => {
       Attributes: {
         FifoQueue: "true",
         ContentBasedDeduplication: "false",
+        RedrivePolicy: JSON.stringify({
+          deadLetterTargetArn: dlqArn,
+          maxReceiveCount: MAX_SQS_ATTEMPTS,
+        }),
       },
     }),
   );
@@ -80,12 +121,14 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  if (queueUrl !== undefined) {
-    await client.send(
-      new DeleteQueueCommand({
-        QueueUrl: queueUrl,
-      }),
-    );
+  for (const url of [queueUrl, dlqUrl]) {
+    if (url !== undefined) {
+      await client.send(
+        new DeleteQueueCommand({
+          QueueUrl: url,
+        }),
+      );
+    }
   }
 });
 
@@ -296,14 +339,18 @@ function handlerForTest(): SqsWagerMessageHandler {
   );
 }
 
-async function receiveForTest() {
+async function receiveForTest(url = currentQueueUrl()) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const received = await client.send(
       new ReceiveMessageCommand({
-        QueueUrl: currentQueueUrl(),
+        QueueUrl: url,
         MaxNumberOfMessages: 1,
         WaitTimeSeconds: 1,
-        MessageSystemAttributeNames: ["ApproximateReceiveCount"],
+        MessageSystemAttributeNames: [
+          "ApproximateReceiveCount",
+          "MessageGroupId",
+        ],
+        MessageAttributeNames: ["All"],
       }),
     );
 
@@ -556,4 +603,257 @@ test("falha no ack após commit não duplica efeitos na reentrega", async () => 
   expect(outcome.result.idempotentReplay).toBe(true);
 
   await expectAppliedOnce(envelope);
+}, 20_000);
+
+function currentDlqUrl(): string {
+  if (dlqUrl === undefined) {
+    throw new Error("DLQ de teste não inicializada.");
+  }
+
+  return dlqUrl;
+}
+
+function failureHandlerForTest(): SqsWagerFailureHandler {
+  return new SqsWagerFailureHandler(client, currentQueueUrl(), currentDlqUrl());
+}
+
+async function expectSourceQueueEmpty(): Promise<void> {
+  const response = await client.send(
+    new GetQueueAttributesCommand({
+      QueueUrl: currentQueueUrl(),
+      AttributeNames: [
+        "ApproximateNumberOfMessages",
+        "ApproximateNumberOfMessagesNotVisible",
+      ],
+    }),
+  );
+
+  expect(response.Attributes?.ApproximateNumberOfMessages).toBe("0");
+  expect(response.Attributes?.ApproximateNumberOfMessagesNotVisible).toBe("0");
+}
+
+test("retry real preserva a mensagem e incrementa o contador no SQS", async () => {
+  const { envelope } = await scenarioForTest();
+  const message = await sendAndReceiveForTest(envelope);
+
+  expect(message.Attributes?.ApproximateReceiveCount).toBe("1");
+
+  const decision = await failureHandlerForTest().handle(
+    message,
+    new Error("Falha transitória simulada antes do processamento."),
+  );
+
+  expect(decision).toEqual({
+    action: "RETRY",
+    attempt: 1,
+    delaySeconds: 1,
+    reason: "TRANSIENT_ERROR",
+  });
+
+  await expectBalanceMatchesLedger(envelope.data.walletId, "100.00");
+
+  const redelivered = await receiveForTest();
+
+  expect(redelivered.MessageId).toBe(message.MessageId);
+  expect(redelivered.Attributes?.ApproximateReceiveCount).toBe("2");
+
+  const outcome = await handlerForTest().handle(redelivered);
+
+  expect(outcome.result.idempotentReplay).toBe(false);
+
+  await expectAppliedOnce(envelope);
+}, 20_000);
+
+test("entrada inválida vai para DLQ com corpo e motivo preservados", async () => {
+  const { envelope } = await scenarioForTest();
+  envelope.data.kind = "OPENING";
+
+  const message = await sendAndReceiveForTest(envelope);
+
+  const failure = await handlerForTest()
+    .handle(message)
+    .then(
+      () => {
+        throw new Error("Era esperada uma falha de validação.");
+      },
+      (error: unknown) => error,
+    );
+
+  expect(failure).toBeInstanceOf(InvalidInputError);
+
+  const decision = await failureHandlerForTest().handle(message, failure);
+
+  expect(decision).toEqual({
+    action: "DLQ",
+    attempt: 1,
+    reason: "INVALID_INPUT",
+  });
+
+  const deadLetter = await receiveForTest(currentDlqUrl());
+
+  expect(deadLetter.Body).toBe(message.Body);
+  expect(deadLetter.Attributes?.MessageGroupId).toBe(envelope.data.walletId);
+  expect(deadLetter.MessageAttributes?.failureReason?.StringValue).toBe(
+    "INVALID_INPUT",
+  );
+  expect(deadLetter.MessageAttributes?.sourceMessageId?.StringValue).toBe(
+    message.MessageId,
+  );
+
+  const reader = orm.em.fork({ schema });
+
+  expect(
+    await reader.findOne(InboxMessageRecord, {
+      consumerName: WAGER_CONSUMER_NAME,
+      messageId: envelope.messageId,
+    }),
+  ).toBeNull();
+
+  expect(
+    await reader.count(WalletLedgerEntryRecord, {
+      walletId: envelope.data.walletId,
+    }),
+  ).toBe(1);
+
+  await expectBalanceMatchesLedger(envelope.data.walletId, "100.00");
+  await expectSourceQueueEmpty();
+}, 20_000);
+
+test("quinta tentativa transitória encaminha para DLQ", async () => {
+  const { envelope } = await scenarioForTest();
+  let message = await sendAndReceiveForTest(envelope);
+
+  for (let attempt = 1; attempt < MAX_SQS_ATTEMPTS; attempt += 1) {
+    message = await redeliverForTest(message.ReceiptHandle);
+  }
+
+  expect(message.Attributes?.ApproximateReceiveCount).toBe(
+    String(MAX_SQS_ATTEMPTS),
+  );
+
+  const decision = await failureHandlerForTest().handle(
+    message,
+    new Error("Falha transitória persistente."),
+  );
+
+  expect(decision).toEqual({
+    action: "DLQ",
+    attempt: MAX_SQS_ATTEMPTS,
+    reason: "RETRIES_EXHAUSTED",
+  });
+
+  const deadLetter = await receiveForTest(currentDlqUrl());
+
+  expect(deadLetter.Body).toBe(message.Body);
+  expect(deadLetter.MessageAttributes?.failureReason?.StringValue).toBe(
+    "RETRIES_EXHAUSTED",
+  );
+  expect(deadLetter.MessageAttributes?.receiveCount?.StringValue).toBe(
+    String(MAX_SQS_ATTEMPTS),
+  );
+
+  await expectBalanceMatchesLedger(envelope.data.walletId, "100.00");
+  await expectSourceQueueEmpty();
+}, 20_000);
+
+test("falha no envio à DLQ preserva a mensagem para nova tentativa", async () => {
+  const { envelope } = await scenarioForTest();
+  envelope.data.kind = "OPENING";
+
+  const message = await sendAndReceiveForTest(envelope);
+  const failure = new InvalidInputError("kind");
+
+  const missingDlqUrl = currentDlqUrl().replace(
+    /[^/]+$/,
+    `missing-${crypto.randomUUID()}.fifo`,
+  );
+
+  const brokenHandler = new SqsWagerFailureHandler(
+    client,
+    currentQueueUrl(),
+    missingDlqUrl,
+  );
+
+  await expect(brokenHandler.handle(message, failure)).rejects.toMatchObject({
+    $metadata: {
+      httpStatusCode: 400,
+    },
+  });
+
+  const redelivered = await redeliverForTest(message.ReceiptHandle);
+
+  expect(redelivered.MessageId).toBe(message.MessageId);
+  expect(redelivered.Body).toBe(message.Body);
+
+  const decision = await failureHandlerForTest().handle(redelivered, failure);
+
+  expect(decision.action).toBe("DLQ");
+
+  const deadLetter = await receiveForTest(currentDlqUrl());
+
+  expect(deadLetter.Body).toBe(message.Body);
+  expect(deadLetter.MessageAttributes?.failureReason?.StringValue).toBe(
+    "INVALID_INPUT",
+  );
+
+  await expectBalanceMatchesLedger(envelope.data.walletId, "100.00");
+  await expectSourceQueueEmpty();
+}, 20_000);
+
+test("saldo insuficiente confirma rejeição com ack sem enviar para DLQ", async () => {
+  const { envelope } = await scenarioForTest();
+  envelope.data.money.amount = "180.00";
+
+  const message = await sendAndReceiveForTest(envelope);
+  const outcome = await handlerForTest().handle(message);
+
+  expect(outcome.result.status).toBe(WagerTransactionStatus.Rejected);
+  expect(outcome.result.failureCode).toBe(FailureCode.InsufficientBalance);
+  expect(outcome.result.balance.amount).toBe("100.00");
+
+  const reader = orm.em.fork({ schema });
+
+  const transaction = await reader.findOneOrFail(WagerTransactionRecord, {
+    id: outcome.result.transactionId,
+  });
+
+  expect(transaction.status).toBe(WagerTransactionStatus.Rejected);
+
+  const inbox = await reader.findOneOrFail(InboxMessageRecord, {
+    consumerName: WAGER_CONSUMER_NAME,
+    messageId: envelope.messageId,
+  });
+
+  expect(inbox.processedAt).not.toBeNull();
+
+  expect(
+    await reader.count(WalletLedgerEntryRecord, {
+      walletId: envelope.data.walletId,
+    }),
+  ).toBe(1);
+
+  const events = await reader.find(OutboxMessageRecord, {
+    aggregateId: transaction.id,
+  });
+
+  expect(events).toHaveLength(1);
+  expect(events[0]?.eventType).toBe("WagerTransactionRejected");
+
+  expect(
+    await reader.count(OutboxMessageRecord, {
+      aggregateId: envelope.data.walletId,
+    }),
+  ).toBe(1);
+
+  const dlqAttributes = await client.send(
+    new GetQueueAttributesCommand({
+      QueueUrl: currentDlqUrl(),
+      AttributeNames: ["ApproximateNumberOfMessages"],
+    }),
+  );
+
+  expect(dlqAttributes.Attributes?.ApproximateNumberOfMessages).toBe("0");
+
+  await expectBalanceMatchesLedger(envelope.data.walletId, "100.00");
+  await expectSourceQueueEmpty();
 }, 20_000);
