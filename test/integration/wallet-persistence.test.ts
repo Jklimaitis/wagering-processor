@@ -25,6 +25,13 @@ import { WagerTransactionProcessed } from "../../src/domain/wager-transaction-ev
 import { WagerTransactionMapper } from "../../src/infrastructure/database/wager-transaction-mapper";
 import { OutboxMessageMapper } from "../../src/infrastructure/database/outbox-message-mapper";
 import { OutboxMessageRecord } from "../../src/infrastructure/database/outbox-message-record";
+import { InboxMessage } from "../../src/domain/inbox-message";
+import { InboxMessageMapper } from "../../src/infrastructure/database/inbox-message-mapper";
+import { InboxMessageRecord } from "../../src/infrastructure/database/inbox-message-record";
+import {
+  InboxPayloadConflictError,
+  PostgresInboxWagerProcessor,
+} from "../../src/infrastructure/database/postgres-inbox-wager-processor";
 
 const schema = `wallet_persistence_${crypto.randomUUID().replaceAll("-", "")}`;
 
@@ -1213,6 +1220,537 @@ test("falha na outbox desfaz a operação financeira", async () => {
   expect(await outboxEventsForTransaction(bet.id)).toHaveLength(0);
 
   expect(await outboxEventsForTransaction(funding.id)).toHaveLength(2);
+
+  await expectLedgerMatchesWallet(wallet.id);
+});
+
+function inboxRecordForTest(): InboxMessageRecord {
+  return InboxMessageMapper.toRecord(
+    InboxMessage.receive(
+      {
+        consumerName: "wager-consumer",
+        messageId: crypto.randomUUID(),
+        payloadHash: "test-hash",
+      },
+      new Date("2026-10-29T12:00:00.000Z"),
+    ),
+  );
+}
+
+async function insertInboxForTest(record: InboxMessageRecord): Promise<void> {
+  await orm.em.fork({ schema }).execute(
+    `
+      insert into "${schema}".inbox_messages (
+        consumer_name, message_id, payload_hash,
+        received_at, processed_at
+      )
+      values (?, ?, ?, ?, ?)
+    `,
+    [
+      record.consumerName,
+      record.messageId,
+      record.payloadHash,
+      record.receivedAt,
+      record.processedAt,
+    ],
+  );
+}
+
+test("persiste a identidade composta e a conclusão da inbox", async () => {
+  const original = inboxRecordForTest();
+  const writer = orm.em.fork({ schema });
+
+  writer.persist(original);
+  await writer.flush();
+
+  const reader = orm.em.fork({ schema });
+
+  const loaded = await reader.findOneOrFail(InboxMessageRecord, {
+    consumerName: original.consumerName,
+    messageId: original.messageId,
+  });
+
+  const message = InboxMessageMapper.toDomain(loaded);
+
+  expect(message.consumerName).toBe(original.consumerName);
+  expect(message.messageId).toBe(original.messageId);
+  expect(message.payloadHash).toBe(original.payloadHash);
+  expect(message.receivedAt).toEqual(original.receivedAt);
+  expect(message.isProcessed()).toBe(false);
+  expect(loaded.processedAt).toBeNull();
+
+  const at = new Date("2026-10-29T12:00:01.000Z");
+
+  message.markProcessed(at);
+  loaded.processedAt = message.processedAt ?? null;
+
+  await reader.flush();
+
+  const finalized = InboxMessageMapper.toDomain(
+    await orm.em.fork({ schema }).findOneOrFail(InboxMessageRecord, {
+      consumerName: original.consumerName,
+      messageId: original.messageId,
+    }),
+  );
+
+  expect(finalized.isProcessed()).toBe(true);
+  expect(finalized.processedAt).toEqual(at);
+  expect(finalized.receivedAt).toEqual(original.receivedAt);
+});
+
+test("impede repetir a entrega para o mesmo consumidor", async () => {
+  const record = inboxRecordForTest();
+
+  await insertInboxForTest(record);
+
+  await expect(
+    insertInboxForTest({
+      ...record,
+      payloadHash: "different-hash",
+    }),
+  ).rejects.toMatchObject({
+    code: "23505",
+    constraint: "inbox_messages_pkey",
+  });
+});
+
+test("permite o mesmo messageId para consumidores diferentes", async () => {
+  const record = inboxRecordForTest();
+
+  await insertInboxForTest(record);
+
+  await insertInboxForTest({
+    ...record,
+    consumerName: "another-consumer",
+  });
+
+  expect(
+    await orm.em
+      .fork({ schema })
+      .count(InboxMessageRecord, { messageId: record.messageId }),
+  ).toBe(2);
+});
+
+test.each(["consumerName", "messageId", "payloadHash"] as const)(
+  "banco rejeita campo vazio na inbox: %s",
+  async (field) => {
+    const record = inboxRecordForTest();
+
+    // Altera o record para testar a barreira do banco diretamente.
+    record[field] = "";
+
+    await expect(insertInboxForTest(record)).rejects.toMatchObject({
+      code: "23514",
+      constraint: "inbox_messages_required_values",
+    });
+  },
+);
+
+test("reverte a inbox preservando finanças e outbox", async () => {
+  const wallet = await emptyWalletForWagerTest();
+
+  const processor = new PostgresWagerProcessor(orm.em.fork({ schema }));
+
+  const funding = wagerPropsForTest(wallet, {
+    kind: WagerTransactionKind.Win,
+    money: Money.from({
+      amount: "100.00",
+      currency: "BRL",
+    }),
+  });
+
+  await processor.process(funding);
+
+  const inbox = inboxRecordForTest();
+  await insertInboxForTest(inbox);
+
+  await orm.migrator.down({
+    schema,
+    to: "Migration20261029000400",
+  });
+
+  const reader = orm.em.fork({ schema });
+
+  const removed = await reader.execute<{ name: string | null }[]>(
+    "select to_regclass(?)::text as name",
+    [`${schema}.inbox_messages`],
+  );
+
+  expect(removed[0]?.name).toBeNull();
+
+  const storedWallet = await reader.findOneOrFail(WalletRecord, {
+    id: wallet.id,
+  });
+
+  expect(storedWallet.balance).toBe("100.00");
+
+  expect(await outboxEventsForTransaction(funding.id)).toHaveLength(2);
+
+  await expectLedgerMatchesWallet(wallet.id);
+
+  await orm.migrator.up({ schema });
+
+  expect(
+    await orm.em.fork({ schema }).count(InboxMessageRecord, {
+      consumerName: inbox.consumerName,
+      messageId: inbox.messageId,
+    }),
+  ).toBe(0);
+}, 30_000);
+
+async function inboxScenarioForTest() {
+  const wallet = await emptyWalletForWagerTest();
+
+  const funding = wagerPropsForTest(wallet, {
+    kind: WagerTransactionKind.Win,
+    money: Money.from({
+      amount: "100.00",
+      currency: "BRL",
+    }),
+  });
+
+  await new PostgresWagerProcessor(orm.em.fork({ schema })).process(funding);
+
+  return {
+    walletId: wallet.id,
+    funding,
+    bet: wagerPropsForTest(wallet),
+    delivery: {
+      consumerName: "wager-consumer",
+      messageId: crypto.randomUUID(),
+    },
+    consumer: new PostgresInboxWagerProcessor(orm.em.fork({ schema })),
+  };
+}
+
+test("inbox confirma uma entrega e protege seus reenvios", async () => {
+  const { walletId, bet, delivery, consumer } = await inboxScenarioForTest();
+
+  const first = await consumer.process(delivery, bet);
+
+  expect(first.status).toBe(WagerTransactionStatus.Processed);
+  expect(first.idempotentReplay).toBe(false);
+
+  const before = await orm.em
+    .fork({ schema })
+    .findOneOrFail(InboxMessageRecord, delivery);
+
+  expect(before.processedAt).not.toBeNull();
+  expect(before.payloadHash).toMatch(/^[0-9a-f]{64}$/);
+
+  const originalEvents = await outboxEventsForTransaction(bet.id);
+
+  const replay = await consumer.process(delivery, {
+    ...bet,
+    id: crypto.randomUUID(),
+  });
+
+  expect(replay).toEqual({
+    ...first,
+    idempotentReplay: true,
+  });
+
+  const changedRequests = [
+    {
+      ...bet,
+      id: crypto.randomUUID(),
+      money: Money.from({
+        amount: "26.00",
+        currency: "BRL",
+      }),
+    },
+    {
+      ...bet,
+      id: crypto.randomUUID(),
+      idempotencyKey: `another:${crypto.randomUUID()}`,
+    },
+  ];
+
+  for (const changed of changedRequests) {
+    await expect(consumer.process(delivery, changed)).rejects.toBeInstanceOf(
+      InboxPayloadConflictError,
+    );
+  }
+
+  const after = await orm.em
+    .fork({ schema })
+    .findOneOrFail(InboxMessageRecord, delivery);
+
+  expect(after.receivedAt).toEqual(before.receivedAt);
+  expect(after.processedAt).toEqual(before.processedAt);
+  expect(after.payloadHash).toBe(before.payloadHash);
+
+  // Uma entrega diferente pode apontar para a mesma aposta.
+  const anotherDelivery = {
+    ...delivery,
+    messageId: crypto.randomUUID(),
+  };
+
+  const anotherReplay = await consumer.process(anotherDelivery, {
+    ...bet,
+    id: crypto.randomUUID(),
+  });
+
+  expect(anotherReplay.idempotentReplay).toBe(true);
+
+  const reader = orm.em.fork({ schema });
+
+  const anotherInbox = await reader.findOneOrFail(
+    InboxMessageRecord,
+    anotherDelivery,
+  );
+
+  expect(anotherInbox.processedAt).not.toBeNull();
+
+  const wallet = await reader.findOneOrFail(WalletRecord, { id: walletId });
+
+  expect(wallet.balance).toBe("75.00");
+  expect(wallet.version).toBe(3);
+
+  expect(
+    await reader.count(WalletLedgerEntryRecord, {
+      walletId,
+      direction: LedgerDirection.Debit,
+    }),
+  ).toBe(1);
+
+  expect(await outboxEventsForTransaction(bet.id)).toEqual(originalEvents);
+
+  await expectLedgerMatchesWallet(walletId);
+});
+
+test("falha ao concluir a inbox desfaz finanças e outbox", async () => {
+  const { walletId, funding, bet, delivery, consumer } =
+    await inboxScenarioForTest();
+
+  const control = orm.em.fork({ schema });
+
+  // Permite inserir a entrega, mas impede concluir seu processamento.
+  await control.execute(`
+    alter table "${schema}".inbox_messages
+    add constraint inbox_test_failure
+    check (
+      message_id <> '${delivery.messageId}'
+      or processed_at is null
+    )
+  `);
+
+  try {
+    await expect(consumer.process(delivery, bet)).rejects.toMatchObject({
+      code: "23514",
+      constraint: "inbox_test_failure",
+    });
+  } finally {
+    await control.execute(`
+      alter table "${schema}".inbox_messages
+      drop constraint inbox_test_failure
+    `);
+  }
+
+  const reader = orm.em.fork({ schema });
+
+  expect(await reader.findOne(InboxMessageRecord, delivery)).toBeNull();
+
+  expect(
+    await reader.findOne(WagerTransactionRecord, { id: bet.id }),
+  ).toBeNull();
+
+  expect(
+    await reader.count(WalletLedgerEntryRecord, { transactionId: bet.id }),
+  ).toBe(0);
+
+  expect(await outboxEventsForTransaction(bet.id)).toHaveLength(0);
+
+  expect(await outboxEventsForTransaction(funding.id)).toHaveLength(2);
+
+  const wallet = await reader.findOneOrFail(WalletRecord, { id: walletId });
+
+  expect(wallet.balance).toBe("100.00");
+  expect(wallet.version).toBe(2);
+
+  await expectLedgerMatchesWallet(walletId);
+
+  // Após remover a falha, a mesma entrega pode ser processada.
+  const retried = await consumer.process(delivery, bet);
+
+  expect(retried.status).toBe(WagerTransactionStatus.Processed);
+  expect(retried.idempotentReplay).toBe(false);
+
+  const finalReader = orm.em.fork({ schema });
+
+  const finalWallet = await finalReader.findOneOrFail(WalletRecord, {
+    id: walletId,
+  });
+
+  const finalInbox = await finalReader.findOneOrFail(
+    InboxMessageRecord,
+    delivery,
+  );
+
+  expect(finalWallet.balance).toBe("75.00");
+  expect(finalWallet.version).toBe(3);
+  expect(finalInbox.processedAt).not.toBeNull();
+
+  expect(await outboxEventsForTransaction(bet.id)).toHaveLength(2);
+
+  await expectLedgerMatchesWallet(walletId);
+});
+
+test("dez reenvios paralelos da mesma entrega produzem um débito", async () => {
+  const { walletId, bet, delivery } = await inboxScenarioForTest();
+
+  const attempts = await Promise.allSettled(
+    Array.from({ length: 10 }, () => {
+      const consumer = new PostgresInboxWagerProcessor(orm.em.fork({ schema }));
+
+      return consumer.process(delivery, {
+        ...bet,
+        id: crypto.randomUUID(),
+      });
+    }),
+  );
+
+  expect(attempts.filter((attempt) => attempt.status === "rejected")).toEqual(
+    [],
+  );
+
+  const results = attempts.flatMap((attempt) =>
+    attempt.status === "fulfilled" ? [attempt.value] : [],
+  );
+
+  expect(results).toHaveLength(10);
+
+  expect(results.filter((result) => !result.idempotentReplay)).toHaveLength(1);
+
+  expect(results.filter((result) => result.idempotentReplay)).toHaveLength(9);
+
+  expect(new Set(results.map((result) => result.transactionId)).size).toBe(1);
+
+  expect(
+    results.every(
+      (result) => result.status === WagerTransactionStatus.Processed,
+    ),
+  ).toBe(true);
+
+  const transactionId = results[0]!.transactionId;
+  const reader = orm.em.fork({ schema });
+
+  expect(await reader.count(InboxMessageRecord, delivery)).toBe(1);
+
+  const inbox = await reader.findOneOrFail(InboxMessageRecord, delivery);
+
+  expect(inbox.processedAt).not.toBeNull();
+
+  const wallet = await reader.findOneOrFail(WalletRecord, { id: walletId });
+
+  expect(wallet.balance).toBe("75.00");
+  expect(wallet.version).toBe(3);
+
+  expect(
+    await reader.count(WalletLedgerEntryRecord, {
+      walletId,
+      direction: LedgerDirection.Debit,
+    }),
+  ).toBe(1);
+
+  expect(await outboxEventsForTransaction(transactionId)).toHaveLength(2);
+
+  await expectLedgerMatchesWallet(walletId);
+}, 30_000);
+
+test("entregas distintas concorrentes compartilham o resultado financeiro", async () => {
+  const { walletId, bet, delivery } = await inboxScenarioForTest();
+
+  const deliveries = [
+    delivery,
+    {
+      ...delivery,
+      messageId: crypto.randomUUID(),
+    },
+  ];
+
+  const attempts = await Promise.allSettled(
+    deliveries.map((currentDelivery) => {
+      const consumer = new PostgresInboxWagerProcessor(orm.em.fork({ schema }));
+
+      return consumer.process(currentDelivery, {
+        ...bet,
+        id: crypto.randomUUID(),
+      });
+    }),
+  );
+
+  expect(attempts.filter((attempt) => attempt.status === "rejected")).toEqual(
+    [],
+  );
+
+  const results = attempts.flatMap((attempt) =>
+    attempt.status === "fulfilled" ? [attempt.value] : [],
+  );
+
+  expect(results).toHaveLength(2);
+
+  expect(results.filter((result) => !result.idempotentReplay)).toHaveLength(1);
+
+  expect(results.filter((result) => result.idempotentReplay)).toHaveLength(1);
+
+  expect(new Set(results.map((result) => result.transactionId)).size).toBe(1);
+
+  const reader = orm.em.fork({ schema });
+
+  const inboxes = await reader.find(InboxMessageRecord, {
+    consumerName: delivery.consumerName,
+    messageId: {
+      $in: deliveries.map((item) => item.messageId),
+    },
+  });
+
+  expect(inboxes).toHaveLength(2);
+  expect(inboxes.every((inbox) => inbox.processedAt !== null)).toBe(true);
+
+  const wallet = await reader.findOneOrFail(WalletRecord, { id: walletId });
+
+  expect(wallet.balance).toBe("75.00");
+  expect(wallet.version).toBe(3);
+
+  expect(
+    await outboxEventsForTransaction(results[0]!.transactionId),
+  ).toHaveLength(2);
+
+  await expectLedgerMatchesWallet(walletId);
+}, 30_000);
+
+test("rejeição por saldo insuficiente conclui a inbox", async () => {
+  const wallet = await emptyWalletForWagerTest();
+
+  const consumer = new PostgresInboxWagerProcessor(orm.em.fork({ schema }));
+
+  const delivery = {
+    consumerName: "wager-consumer",
+    messageId: crypto.randomUUID(),
+  };
+
+  const bet = wagerPropsForTest(wallet);
+
+  const result = await consumer.process(delivery, bet);
+
+  expect(result.status).toBe(WagerTransactionStatus.Rejected);
+  expect(result.failureCode).toBe(FailureCode.InsufficientBalance);
+
+  const reader = orm.em.fork({ schema });
+
+  const inbox = await reader.findOneOrFail(InboxMessageRecord, delivery);
+
+  expect(inbox.processedAt).not.toBeNull();
+
+  expect(
+    await reader.count(WalletLedgerEntryRecord, { walletId: wallet.id }),
+  ).toBe(0);
+
+  const events = await outboxEventsForTransaction(bet.id);
+
+  expect(events).toHaveLength(1);
+  expect(events[0]?.event_type).toBe("WagerTransactionRejected");
 
   await expectLedgerMatchesWallet(wallet.id);
 });

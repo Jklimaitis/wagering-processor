@@ -87,14 +87,14 @@ export class PostgresWagerProcessor {
       );
     }
 
-    const previous = await this.findReplay(this.em.fork(), props, payloadHash);
+    const previous = await this.findReplay(this.em.fork({ keepTransactionContext: true }), props, payloadHash);
 
     if (previous !== undefined) {
       return previous;
     }
 
     try {
-      return await this.em.fork().transactional(
+      return await this.em.fork({ keepTransactionContext: true }).transactional(
         async (em) => {
           const walletRecord = await em.findOneOrFail(
             WalletRecord,
@@ -197,7 +197,7 @@ export class PostgresWagerProcessor {
       }
 
       // A transação anterior já sofreu rollback.
-      const replay = await this.findReplay(this.em.fork(), props, payloadHash);
+      const replay = await this.findReplay(this.em.fork({ keepTransactionContext: true }), props, payloadHash);
 
       if (replay === undefined) {
         throw error;
