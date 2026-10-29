@@ -38,3 +38,22 @@ export function getSqsEventsQueueName(): string {
 
   return name;
 }
+
+export function getSqsWagerQueueNames(): {
+  queueName: string;
+  dlqName: string;
+} {
+  const queueName = requiredEnvironment("SQS_QUEUE_NAME");
+  const dlqName = requiredEnvironment("SQS_DLQ_NAME");
+
+  const names = [queueName, dlqName, getSqsEventsQueueName()];
+
+  if (
+    names.some((name) => !name.endsWith(".fifo")) ||
+    new Set(names).size !== names.length
+  ) {
+    throw new Error("As três filas devem ser FIFO e ter nomes diferentes.");
+  }
+
+  return { queueName, dlqName };
+}

@@ -40,6 +40,13 @@ import {
 import { InvalidInputError } from "../../src/application/input-validation";
 import { SqsWagerFailureHandler } from "../../src/infrastructure/messaging/sqs-wager-failure-handler";
 import { MAX_SQS_ATTEMPTS } from "../../src/infrastructure/messaging/sqs-wager-failure-policy";
+import {
+  SqsWagerConsumer,
+  type SqsWagerPollResult,
+} from "../../src/infrastructure/messaging/sqs-wager-consumer";
+import { setTimeout as delay } from "node:timers/promises";
+import { LockMode } from "@mikro-orm/core";
+import { fileURLToPath } from "node:url";
 
 const schema = `sqs_consumer_${crypto.randomUUID().replaceAll("-", "")}`;
 const client = createSqsClient();
@@ -364,7 +371,7 @@ async function receiveForTest(url = currentQueueUrl()) {
   throw new Error("Mensagem não recebida na fila de teste.");
 }
 
-async function sendAndReceiveForTest(envelope: TestEnvelope) {
+async function enqueueForTest(envelope: TestEnvelope): Promise<void> {
   await client.send(
     new SendMessageCommand({
       QueueUrl: currentQueueUrl(),
@@ -373,7 +380,10 @@ async function sendAndReceiveForTest(envelope: TestEnvelope) {
       MessageDeduplicationId: crypto.randomUUID(),
     }),
   );
+}
 
+async function sendAndReceiveForTest(envelope: TestEnvelope) {
+  await enqueueForTest(envelope);
   return receiveForTest();
 }
 
@@ -857,3 +867,427 @@ test("saldo insuficiente confirma rejeição com ack sem enviar para DLQ", async
   await expectBalanceMatchesLedger(envelope.data.walletId, "100.00");
   await expectSourceQueueEmpty();
 }, 20_000);
+
+test("consumer recebe, processa e confirma uma aposta real", async () => {
+  const { envelope } = await scenarioForTest();
+  await enqueueForTest(envelope);
+
+  const consumer = new SqsWagerConsumer(
+    client,
+    currentQueueUrl(),
+    handlerForTest(),
+    failureHandlerForTest(),
+    { waitTimeSeconds: 1 },
+  );
+
+  const result = await consumer.poll();
+
+  expect(result.status).toBe("ACKNOWLEDGED");
+
+  if (result.status !== "ACKNOWLEDGED") {
+    throw new Error("Era esperado o processamento com ack.");
+  }
+
+  expect(result.outcome.messageId).toBe(envelope.messageId);
+  expect(result.outcome.result.idempotentReplay).toBe(false);
+  expect(result.heartbeatErrorName).toBeUndefined();
+
+  await expectAppliedOnce(envelope);
+  await expectSourceQueueEmpty();
+}, 20_000);
+
+test("consumer encaminha entrada inválida para DLQ", async () => {
+  const { envelope } = await scenarioForTest();
+  envelope.data.kind = "OPENING";
+
+  await enqueueForTest(envelope);
+
+  const consumer = new SqsWagerConsumer(
+    client,
+    currentQueueUrl(),
+    handlerForTest(),
+    failureHandlerForTest(),
+    { waitTimeSeconds: 1 },
+  );
+
+  const result = await consumer.poll();
+
+  expect(result.status).toBe("FAILURE_HANDLED");
+
+  if (result.status !== "FAILURE_HANDLED") {
+    throw new Error("Era esperado o tratamento da entrada inválida.");
+  }
+
+  expect(result.decision).toEqual({
+    action: "DLQ",
+    attempt: 1,
+    reason: "INVALID_INPUT",
+  });
+
+  const deadLetter = await receiveForTest(currentDlqUrl());
+
+  expect(deadLetter.Body).toBe(JSON.stringify(envelope));
+
+  await expectBalanceMatchesLedger(envelope.data.walletId, "100.00");
+  await expectSourceQueueEmpty();
+}, 20_000);
+
+test("heartbeat mantém a entrega invisível e encerramento aguarda a operação", async () => {
+  const { envelope } = await scenarioForTest();
+  await enqueueForTest(envelope);
+
+  const shutdown = new AbortController();
+
+  const consumer = new SqsWagerConsumer(
+    client,
+    currentQueueUrl(),
+    handlerForTest(),
+    failureHandlerForTest(),
+    {
+      waitTimeSeconds: 1,
+      visibilityTimeoutSeconds: 2,
+    },
+  );
+
+  let notifyHeartbeat!: () => void;
+  let heartbeatCount = 0;
+
+  const heartbeatObserved = new Promise<void>((resolve) => {
+    notifyHeartbeat = resolve;
+  });
+
+  client.middlewareStack.add(
+    (next, context) => async (args) => {
+      const result = await next(args);
+
+      if (context.commandName === "ChangeMessageVisibilityCommand") {
+        heartbeatCount += 1;
+        notifyHeartbeat();
+      }
+
+      return result;
+    },
+    {
+      step: "initialize",
+      name: "observeConsumerHeartbeat",
+    },
+  );
+
+  let polling: Promise<SqsWagerPollResult> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    await orm.em.fork({ schema }).transactional(async (em) => {
+      await em.findOneOrFail(
+        WalletRecord,
+        { id: envelope.data.walletId },
+        { lockMode: LockMode.PESSIMISTIC_WRITE },
+      );
+
+      polling = consumer.poll(shutdown.signal);
+
+      await Promise.race([
+        heartbeatObserved,
+        polling.then(() => {
+          throw new Error(
+            "Consumer terminou antes de liberarmos o lock da wallet.",
+          );
+        }),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error("Heartbeat não foi confirmado pelo SQS."));
+          }, 5_000);
+        }),
+      ]);
+
+      // Simula o pedido de encerramento enquanto a operação está em andamento.
+      shutdown.abort();
+
+      // Ultrapassa a visibilidade inicial de dois segundos.
+      await delay(2_200);
+
+      expect(heartbeatCount).toBeGreaterThanOrEqual(2);
+
+      const competingReceive = await client.send(
+        new ReceiveMessageCommand({
+          QueueUrl: currentQueueUrl(),
+          MaxNumberOfMessages: 1,
+          WaitTimeSeconds: 0,
+        }),
+      );
+
+      expect(competingReceive.Messages ?? []).toHaveLength(0);
+
+      // O retorno deste callback libera o lock da wallet.
+    });
+
+    if (polling === undefined) {
+      throw new Error("Consumer não foi iniciado.");
+    }
+
+    const result = await polling;
+
+    expect(result.status).toBe("ACKNOWLEDGED");
+
+    if (result.status !== "ACKNOWLEDGED") {
+      throw new Error("A operação em andamento deveria terminar com ack.");
+    }
+
+    expect(result.heartbeatErrorName).toBeUndefined();
+    expect(result.outcome.result.status).toBe(WagerTransactionStatus.Processed);
+
+    await expectAppliedOnce(envelope);
+    await expectSourceQueueEmpty();
+
+    expect(await consumer.poll(shutdown.signal)).toEqual({
+      status: "STOPPED",
+    });
+  } finally {
+    shutdown.abort();
+
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+
+    if (polling !== undefined) {
+      await Promise.allSettled([polling]);
+    }
+
+    client.middlewareStack.remove("observeConsumerHeartbeat");
+  }
+}, 20_000);
+
+function startConsumerProcess(pauseBeforeAck = false) {
+  const queueName = new URL(currentQueueUrl()).pathname.split("/").at(-1);
+  const dlqName = new URL(currentDlqUrl()).pathname.split("/").at(-1);
+
+  if (!queueName || !dlqName) {
+    throw new Error("URLs das filas de teste inválidas.");
+  }
+
+  const workerPath = fileURLToPath(
+    new URL(
+      pauseBeforeAck
+        ? "../helpers/wager-before-ack-worker.ts"
+        : "../../src/workers/wager-worker.ts",
+      import.meta.url,
+    ),
+  );
+
+  let notifyBeforeAck!: () => void;
+
+  const beforeAck = new Promise<void>((resolve) => {
+    notifyBeforeAck = resolve;
+  });
+
+  const worker = Bun.spawn([process.execPath, workerPath], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      DATABASE_SCHEMA: schema,
+      SQS_QUEUE_NAME: queueName,
+      SQS_DLQ_NAME: dlqName,
+    },
+    timeout: 20_000,
+    killSignal: "SIGKILL",
+    ...(pauseBeforeAck
+      ? {
+          serialization: "json" as const,
+          ipc(message: unknown) {
+            if (message === "before-ack") {
+              notifyBeforeAck();
+            }
+          },
+        }
+      : {}),
+  });
+
+  let output = "";
+
+  const stdout = (async () => {
+    const reader = worker.stdout.getReader();
+    const decoder = new TextDecoder();
+
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+
+        if (chunk.done) {
+          break;
+        }
+
+        output += decoder.decode(chunk.value, { stream: true });
+      }
+
+      output += decoder.decode();
+      return output;
+    } finally {
+      reader.releaseLock();
+    }
+  })();
+
+  return {
+    worker,
+    beforeAck,
+    stdout,
+    stderr: new Response(worker.stderr).text(),
+    output: () => output,
+  };
+}
+
+type ConsumerProcessHandle = ReturnType<typeof startConsumerProcess>;
+
+async function consumerDeadline<T>(operation: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error("Timeout aguardando o processo consumidor."));
+        }, 10_000);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+async function waitForConsumerEvent(
+  handle: ConsumerProcessHandle,
+  event: string,
+): Promise<void> {
+  await consumerDeadline(
+    (async () => {
+      while (!handle.output().includes(`"event":"${event}"`)) {
+        if (
+          handle.worker.exitCode !== null ||
+          handle.worker.signalCode !== null
+        ) {
+          throw new Error(
+            `Worker encerrou antes de ${event}: ` +
+              `${handle.output()} ${await handle.stderr}`,
+          );
+        }
+
+        await delay(20);
+      }
+    })(),
+  );
+}
+
+async function cleanupConsumerProcess(
+  handle: ConsumerProcessHandle,
+): Promise<void> {
+  if (handle.worker.exitCode === null && handle.worker.signalCode === null) {
+    handle.worker.kill("SIGKILL");
+  }
+
+  await Promise.allSettled([
+    handle.worker.exited,
+    handle.stdout,
+    handle.stderr,
+  ]);
+}
+
+test("processo consumidor encerra normalmente com SIGTERM", async () => {
+  const handle = startConsumerProcess();
+
+  try {
+    await waitForConsumerEvent(handle, "wager_worker_ready");
+
+    handle.worker.kill("SIGTERM");
+
+    expect(await consumerDeadline(handle.worker.exited)).toBe(0);
+
+    const output = await handle.stdout;
+
+    expect(output).toContain('"event":"wager_worker_stopping"');
+    expect(output).toContain('"event":"wager_worker_stopped"');
+    expect(output).not.toContain('"event":"wager_worker_failed"');
+  } finally {
+    await cleanupConsumerProcess(handle);
+  }
+}, 30_000);
+
+test("queda após commit e antes do ack permite replay em novo processo", async () => {
+  const { envelope } = await scenarioForTest();
+  await enqueueForTest(envelope);
+
+  const first = startConsumerProcess(true);
+  let second: ConsumerProcessHandle | undefined;
+
+  try {
+    await consumerDeadline(
+      Promise.race([
+        first.beforeAck,
+        first.worker.exited.then(async () => {
+          throw new Error(
+            `Primeiro worker encerrou antes do ack: ${await first.stderr}`,
+          );
+        }),
+      ]),
+    );
+
+    // Uma conexão independente comprova o commit antes da queda.
+    await expectAppliedOnce(envelope);
+
+    const reader = orm.em.fork({ schema });
+
+    const transaction = await reader.findOneOrFail(WagerTransactionRecord, {
+      providerId: envelope.data.providerId,
+      externalTransactionId: envelope.data.externalTransactionId,
+    });
+
+    const eventFilter = {
+      $or: [
+        { aggregateId: envelope.data.walletId },
+        { aggregateId: transaction.id },
+      ],
+    };
+
+    const eventsBefore = await reader.find(OutboxMessageRecord, eventFilter);
+
+    const eventIdsBefore = eventsBefore.map((event) => event.id).sort();
+
+    first.worker.kill("SIGKILL");
+    await consumerDeadline(first.worker.exited);
+
+    expect(first.worker.signalCode).toBe("SIGKILL");
+
+    second = startConsumerProcess();
+
+    await waitForConsumerEvent(second, "wager_message_acknowledged");
+
+    expect(second.worker.pid).not.toBe(first.worker.pid);
+
+    second.worker.kill("SIGTERM");
+
+    expect(await consumerDeadline(second.worker.exited)).toBe(0);
+
+    const output = await second.stdout;
+
+    expect(output).toContain('"idempotentReplay":true');
+    expect(output).toContain(`"transactionId":"${transaction.id}"`);
+
+    await expectAppliedOnce(envelope);
+    await expectSourceQueueEmpty();
+
+    const eventsAfter = await orm.em
+      .fork({ schema })
+      .find(OutboxMessageRecord, eventFilter);
+
+    expect(eventsAfter.map((event) => event.id).sort()).toEqual(eventIdsBefore);
+  } finally {
+    await cleanupConsumerProcess(first);
+
+    if (second !== undefined) {
+      await cleanupConsumerProcess(second);
+    }
+  }
+}, 30_000);
