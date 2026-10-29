@@ -56,6 +56,10 @@ export enum FailureCode {
   InvalidReference = "INVALID_REFERENCE",
   AlreadyReversed = "ALREADY_REVERSED",
   PermanentInfrastructureError = "PERMANENT_INFRASTRUCTURE_ERROR",
+  WalletMismatch = "WALLET_MISMATCH",
+  PlayerMismatch = "PLAYER_MISMATCH",
+  CurrencyMismatch = "CURRENCY_MISMATCH",
+  MonetaryLimitExceeded = "MONETARY_LIMIT_EXCEEDED",
 }
 
 export class InvalidTransactionStateError extends Error {
