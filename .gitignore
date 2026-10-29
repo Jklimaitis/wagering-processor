@@ -4,3 +4,4 @@ dist/
 *.log
 bun.lockb
 .DS_Store
+.vscode/
