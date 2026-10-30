@@ -10,6 +10,8 @@ import {
 import { SqsWagerConsumer } from "../infrastructure/messaging/sqs-wager-consumer";
 import { SqsWagerFailureHandler } from "../infrastructure/messaging/sqs-wager-failure-handler";
 import { SqsWagerMessageHandler } from "../infrastructure/messaging/sqs-wager-message-handler";
+import { MetricsService } from "../metrics.service";
+import { startWorkerMetrics } from "./worker-metrics";
 
 const shutdown = new AbortController();
 
@@ -53,6 +55,8 @@ async function pause(): Promise<void> {
 
 async function main(): Promise<void> {
   const client = createSqsClient();
+  const metrics = new MetricsService();
+  let metricsServer: ReturnType<typeof startWorkerMetrics> | undefined;
   let orm: MikroORM | undefined;
 
   try {
@@ -81,11 +85,13 @@ async function main(): Promise<void> {
         client,
         queue.QueueUrl,
         new PostgresInboxWagerProcessor(orm.em),
+        metrics,
       ),
-      new SqsWagerFailureHandler(client, queue.QueueUrl, dlq.QueueUrl),
+      new SqsWagerFailureHandler(client, queue.QueueUrl, dlq.QueueUrl, metrics),
     );
 
-    log("info", "wager_worker_ready", { queueName, dlqName });
+    metricsServer = startWorkerMetrics(metrics);
+    log("info", "wager_worker_ready", { queueName, dlqName, metricsPort: metricsServer.port });
 
     while (!shutdown.signal.aborted) {
       try {
@@ -135,11 +141,13 @@ async function main(): Promise<void> {
     }
   } finally {
     try {
-      if (orm !== undefined) {
-        await orm.close(true);
-      }
+      await metricsServer?.stop(true);
     } finally {
-      client.destroy();
+      try {
+        if (orm !== undefined) await orm.close(true);
+      } finally {
+        client.destroy();
+      }
     }
   }
 

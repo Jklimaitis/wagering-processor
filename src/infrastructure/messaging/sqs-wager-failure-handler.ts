@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { MetricsService } from "../../metrics.service";
 import {
   ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
@@ -16,6 +17,7 @@ export class SqsWagerFailureHandler {
     private readonly client: SQSClient,
     private readonly queueUrl: string,
     private readonly dlqUrl: string,
+    private readonly metrics?: Pick<MetricsService, "recordRetry" | "recordDlq">,
   ) {
     if (queueUrl === dlqUrl) {
       throw new Error("Fila principal e DLQ devem ser diferentes.");
@@ -46,6 +48,7 @@ export class SqsWagerFailureHandler {
         },
       );
 
+      this.metrics?.recordRetry("sqs");
       return decision;
     }
 
@@ -93,6 +96,7 @@ export class SqsWagerFailureHandler {
       },
     );
 
+    this.metrics?.recordDlq(decision.reason);
     return decision;
   }
 }

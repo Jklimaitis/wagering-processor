@@ -1,4 +1,5 @@
-import { Controller, Get, Inject, Param } from "@nestjs/common";
+import { Controller, Get, Inject, Param, UseGuards } from "@nestjs/common";
+import { ProviderIdentityGuard } from "./provider-identity.guard";
 import { readString } from "./application/input-validation";
 import { DatabaseService } from "./infrastructure/database/database.service";
 import {
@@ -7,6 +8,7 @@ import {
 } from "./infrastructure/database/postgres-financial-reader";
 
 @Controller("providers")
+@UseGuards(ProviderIdentityGuard)
 export class ProviderTransactionsController {
   constructor(
     @Inject(DatabaseService)

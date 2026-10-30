@@ -71,6 +71,7 @@ interface ReferenceReprocessProgress {
   providerId: string;
   correlationId: string;
   attempts: number;
+  messageId: string | null;
 }
 
 export type PendingReferenceResult =
@@ -286,6 +287,7 @@ export class PostgresWagerProcessor {
           providerId: record.providerId,
           correlationId: context.correlationId,
           attempts: record.referenceAttempts,
+          messageId: record.causationId,
         };
 
         if (transaction.status === WagerTransactionStatus.PendingReference) {

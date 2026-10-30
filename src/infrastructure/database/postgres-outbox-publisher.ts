@@ -3,15 +3,24 @@ import type { EntityManager } from "@mikro-orm/postgresql";
 import type { EventPublisher } from "../../application/event-publisher";
 import { OutboxMessageMapper } from "./outbox-message-mapper";
 import { OutboxMessageRecord } from "./outbox-message-record";
+import { WagerTransactionRecord } from "./wager-transaction-record";
+
+interface OutboxContext {
+  correlationId: string | null;
+  messageId: string | null;
+  transactionId: string | null;
+  walletId: string | null;
+  providerId: string | null;
+}
 
 export type OutboxPublishResult =
   | { status: "IDLE" }
-  | { status: "PUBLISHED"; eventId: string }
-  | {
+  | ({ status: "PUBLISHED"; eventId: string } & OutboxContext)
+  | ({
       status: "RETRY_SCHEDULED";
       eventId: string;
       error: unknown;
-    };
+    } & OutboxContext);
 
 export class PostgresOutboxPublisher {
   constructor(
@@ -45,6 +54,22 @@ export class PostgresOutboxPublisher {
       }
 
       const message = OutboxMessageMapper.toDomain(record);
+      const payload = message.payload;
+      const data = payload.data !== null && typeof payload.data === "object"
+        ? payload.data as Record<string, unknown> : {};
+      const text = (value: unknown) => typeof value === "string" ? value : null;
+      const context: OutboxContext = {
+        correlationId: text(payload.correlationId),
+        messageId: text(payload.causationId),
+        transactionId: text(data.transactionId),
+        walletId: text(data.walletId),
+        providerId: text(data.providerId),
+      };
+      if (context.providerId === null && context.transactionId !== null) {
+        const transaction = await em.findOne(WagerTransactionRecord,
+          { id: context.transactionId }, { fields: ["providerId"] });
+        context.providerId = transaction?.providerId ?? null;
+      }
 
       try {
         await this.publisher.publish(message);
@@ -57,6 +82,7 @@ export class PostgresOutboxPublisher {
         return {
           status: "RETRY_SCHEDULED",
           eventId: message.id,
+          ...context,
           error,
         };
       }
@@ -69,6 +95,7 @@ export class PostgresOutboxPublisher {
       return {
         status: "PUBLISHED",
         eventId: message.id,
+        ...context,
       };
     });
   }

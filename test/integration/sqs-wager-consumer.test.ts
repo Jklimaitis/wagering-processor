@@ -47,6 +47,7 @@ import {
 import { setTimeout as delay } from "node:timers/promises";
 import { LockMode } from "@mikro-orm/core";
 import { fileURLToPath } from "node:url";
+import { MetricsService } from "../../src/metrics.service";
 
 const schema = `sqs_consumer_${crypto.randomUUID().replaceAll("-", "")}`;
 const client = createSqsClient();
@@ -623,8 +624,8 @@ function currentDlqUrl(): string {
   return dlqUrl;
 }
 
-function failureHandlerForTest(): SqsWagerFailureHandler {
-  return new SqsWagerFailureHandler(client, currentQueueUrl(), currentDlqUrl());
+function failureHandlerForTest(metrics?: MetricsService): SqsWagerFailureHandler {
+  return new SqsWagerFailureHandler(client, currentQueueUrl(), currentDlqUrl(), metrics);
 }
 
 async function expectSourceQueueEmpty(): Promise<void> {
@@ -643,12 +644,13 @@ async function expectSourceQueueEmpty(): Promise<void> {
 }
 
 test("retry real preserva a mensagem e incrementa o contador no SQS", async () => {
+  const metrics = new MetricsService();
   const { envelope } = await scenarioForTest();
   const message = await sendAndReceiveForTest(envelope);
 
   expect(message.Attributes?.ApproximateReceiveCount).toBe("1");
 
-  const decision = await failureHandlerForTest().handle(
+  const decision = await failureHandlerForTest(metrics).handle(
     message,
     new Error("Falha transitória simulada antes do processamento."),
   );
@@ -661,6 +663,8 @@ test("retry real preserva a mensagem e incrementa o contador no SQS", async () =
   });
 
   await expectBalanceMatchesLedger(envelope.data.walletId, "100.00");
+
+  expect(await metrics.render()).toContain('wagering_retries_total{source="sqs"} 1');
 
   const redelivered = await receiveForTest();
 
@@ -675,6 +679,7 @@ test("retry real preserva a mensagem e incrementa o contador no SQS", async () =
 }, 20_000);
 
 test("entrada inválida vai para DLQ com corpo e motivo preservados", async () => {
+  const metrics = new MetricsService();
   const { envelope } = await scenarioForTest();
   envelope.data.kind = "OPENING";
 
@@ -691,7 +696,8 @@ test("entrada inválida vai para DLQ com corpo e motivo preservados", async () =
 
   expect(failure).toBeInstanceOf(InvalidInputError);
 
-  const decision = await failureHandlerForTest().handle(message, failure);
+  const decision = await failureHandlerForTest(metrics).handle(message, failure);
+  expect(await metrics.render()).toContain('wagering_dlq_messages_total{reason="INVALID_INPUT"} 1');
 
   expect(decision).toEqual({
     action: "DLQ",
@@ -1089,6 +1095,7 @@ function startConsumerProcess(pauseBeforeAck = false) {
       DATABASE_SCHEMA: schema,
       SQS_QUEUE_NAME: queueName,
       SQS_DLQ_NAME: dlqName,
+      METRICS_PORT: "0",
     },
     timeout: 20_000,
     killSignal: "SIGKILL",
@@ -1161,10 +1168,18 @@ async function consumerDeadline<T>(operation: Promise<T>): Promise<T> {
 async function waitForConsumerEvent(
   handle: ConsumerProcessHandle,
   event: string,
-): Promise<void> {
-  await consumerDeadline(
+): Promise<Record<string, unknown>> {
+  return consumerDeadline(
     (async () => {
-      while (!handle.output().includes(`"event":"${event}"`)) {
+      for (;;) {
+        for (const line of handle.output().split("\n").slice(0, -1)) {
+          let decoded: unknown;
+          try { decoded = JSON.parse(line); } catch { continue; }
+          if (decoded !== null && typeof decoded === "object" &&
+              "event" in decoded && decoded.event === event) {
+            return decoded as Record<string, unknown>;
+          }
+        }
         if (
           handle.worker.exitCode !== null ||
           handle.worker.signalCode !== null
@@ -1195,11 +1210,32 @@ async function cleanupConsumerProcess(
   ]);
 }
 
-test("processo consumidor encerra normalmente com SIGTERM", async () => {
+test("processo consumidor expõe métricas, deduplica e encerra com SIGTERM", async () => {
+  const { envelope } = await scenarioForTest();
   const handle = startConsumerProcess();
 
   try {
-    await waitForConsumerEvent(handle, "wager_worker_ready");
+    const ready = await waitForConsumerEvent(handle, "wager_worker_ready");
+    if (typeof ready.metricsPort !== "number") throw new Error("Porta de métricas ausente.");
+    const metricsUrl = `http://127.0.0.1:${ready.metricsPort}/metrics`;
+    await enqueueForTest(envelope);
+    await waitForConsumerEvent(handle, "wager_message_acknowledged");
+    await enqueueForTest(envelope);
+    const metrics = await consumerDeadline((async () => {
+      for (;;) {
+        const response = await fetch(metricsUrl, { signal: AbortSignal.timeout(2_000) });
+        expect(response.status).toBe(200);
+        const text = await response.text();
+        if (text.includes('wagering_duplicates_total{source="sqs"} 1') &&
+            text.includes('wagering_processing_duration_seconds_count{source="sqs"} 2')) {
+          return text;
+        }
+        await delay(20);
+      }
+    })());
+    expect(metrics).toContain('wagering_transaction_results_total{source="sqs",status="PROCESSED"} 1');
+    await expectAppliedOnce(envelope);
+    await expectSourceQueueEmpty();
 
     handle.worker.kill("SIGTERM");
 

@@ -1324,3 +1324,151 @@ test("health distingue processo vivo de dependências prontas", async () => {
 
   expect(await counts()).toEqual(before);
 }, 15_000);
+
+async function httpMetric(sample: string): Promise<number> {
+  const response = await fetch(`${baseUrl}/metrics`);
+
+  expect(response.status).toBe(200);
+
+  const line = (await response.text())
+    .split("\n")
+    .find((value) => value.startsWith(`${sample} `));
+
+  return line === undefined ? 0 : Number(line.slice(line.lastIndexOf(" ") + 1));
+}
+
+test("métricas distinguem resultados, replay e conflito com logs rastreáveis", async () => {
+  const wallet = await createFundedWallet();
+
+  const samples = {
+    processed:
+      'wagering_transaction_results_total{source="http",status="PROCESSED"}',
+    rejected:
+      'wagering_transaction_results_total{source="http",status="REJECTED"}',
+    pending:
+      'wagering_transaction_results_total{source="http",status="PENDING_REFERENCE"}',
+    duplicates: 'wagering_duplicates_total{source="http"}',
+    latency: 'wagering_processing_duration_seconds_count{source="http"}',
+  };
+
+  const [processed, rejected, pending, duplicates, latency] = await Promise.all(
+    [
+      httpMetric(samples.processed),
+      httpMetric(samples.rejected),
+      httpMetric(samples.pending),
+      httpMetric(samples.duplicates),
+      httpMetric(samples.latency),
+    ],
+  );
+
+  const lines: string[] = [];
+
+  const logSpy = spyOn(console, "log").mockImplementation(
+    (...values: unknown[]) => {
+      for (const value of values) {
+        if (typeof value === "string") {
+          lines.push(value);
+        }
+      }
+    },
+  );
+
+  try {
+    const input = wagerRequest(wallet);
+    const key = `http:${crypto.randomUUID()}`;
+
+    const firstResponse = await postWager(input, key);
+
+    expect(firstResponse.status).toBe(200);
+    expect(firstResponse.headers.get("x-correlation-id")).toBe(
+      "wager-http-test",
+    );
+
+    const first = (await firstResponse.json()) as PostgresWagerResult;
+
+    const replay = await postWager(input, key);
+
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({
+      transactionId: first.transactionId,
+      idempotentReplay: true,
+    });
+
+    const conflict = await postWager(
+      {
+        ...input,
+        money: { amount: "26.00", currency: "BRL" },
+      },
+      key,
+    );
+
+    expect(conflict.status).toBe(409);
+
+    const rejection = await postWager(
+      {
+        ...wagerRequest(wallet),
+        money: { amount: "101.00", currency: "BRL" },
+      },
+      `http:${crypto.randomUUID()}`,
+    );
+
+    expect(rejection.status).toBe(422);
+
+    const pendingResponse = await postWager(
+      {
+        ...wagerRequest(wallet),
+        kind: WagerTransactionKind.Refund,
+        referenceExternalTransactionId: crypto.randomUUID(),
+      },
+      `http:${crypto.randomUUID()}`,
+    );
+
+    expect(pendingResponse.status).toBe(202);
+
+    expect(await httpMetric(samples.processed)).toBe(processed + 1);
+    expect(await httpMetric(samples.rejected)).toBe(rejected + 1);
+    expect(await httpMetric(samples.pending)).toBe(pending + 1);
+    expect(await httpMetric(samples.duplicates)).toBe(duplicates + 1);
+    expect(await httpMetric(samples.latency)).toBe(latency + 5);
+
+    const events = lines.map(
+      (line) => JSON.parse(line) as Record<string, unknown>,
+    );
+
+    const completion = events.find(
+      (event) =>
+        event.event === "wager_http_completed" &&
+        event.transactionId === first.transactionId &&
+        event.idempotentReplay === false,
+    );
+
+    expect(completion).toMatchObject({
+      correlationId: "wager-http-test",
+      messageId: null,
+      transactionId: first.transactionId,
+      walletId: wallet.id,
+      providerId: input.providerId,
+      status: WagerTransactionStatus.Processed,
+    });
+
+    expect(completion).not.toHaveProperty("money");
+    expect(completion).not.toHaveProperty("balance");
+
+    const failure = events.find(
+      (event) =>
+        event.event === "http_request_failed" &&
+        event.code === "IDEMPOTENCY_CONFLICT",
+    );
+
+    expect(failure).toMatchObject({
+      correlationId: "wager-http-test",
+      walletId: wallet.id,
+      providerId: input.providerId,
+      statusCode: 409,
+    });
+
+    await expectLedgerBalance(wallet.id, "75.00");
+  } finally {
+    logSpy.mockRestore();
+  }
+});

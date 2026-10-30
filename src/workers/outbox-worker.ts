@@ -8,6 +8,8 @@ import {
   getSqsEventsQueueName,
 } from "../infrastructure/messaging/sqs-client";
 import { SqsEventPublisher } from "../infrastructure/messaging/sqs-event-publisher";
+import { MetricsService } from "../metrics.service";
+import { startWorkerMetrics } from "./worker-metrics";
 
 const shutdown = new AbortController();
 
@@ -52,6 +54,8 @@ async function pause(milliseconds: number): Promise<void> {
 async function main(): Promise<void> {
   const client = createSqsClient();
   let orm: MikroORM | undefined;
+  const metrics = new MetricsService();
+  let metricsServer: ReturnType<typeof startWorkerMetrics> | undefined;
 
   try {
     const queueName = getSqsEventsQueueName();
@@ -76,24 +80,36 @@ async function main(): Promise<void> {
       orm.em,
       new SqsEventPublisher(client, QueueUrl),
     );
+    const em = orm.em;
+    metricsServer = startWorkerMetrics(metrics, () => metrics.refreshOutbox(em));
 
-    log("info", "outbox_worker_ready", { queueName });
+    log("info", "outbox_worker_ready", { queueName, metricsPort: metricsServer.port });
 
     while (!shutdown.signal.aborted) {
       let pauseMs = 500;
+      const startedAt = performance.now();
 
       try {
         const result = await publisher.publishNext();
+        if (result.status !== "IDLE") {
+          metrics.observeDuration("outbox", performance.now() - startedAt);
+        }
 
         if (result.status === "PUBLISHED") {
           log("info", "outbox_event_published", {
-            eventId: result.eventId,
+            ...result,
           });
 
           pauseMs = 0;
         } else if (result.status === "RETRY_SCHEDULED") {
+          metrics.recordRetry("outbox");
           log("warn", "outbox_retry_scheduled", {
             eventId: result.eventId,
+            correlationId: result.correlationId,
+            messageId: result.messageId,
+            transactionId: result.transactionId,
+            walletId: result.walletId,
+            providerId: result.providerId,
             errorName:
               result.error instanceof Error
                 ? result.error.name
@@ -101,6 +117,7 @@ async function main(): Promise<void> {
           });
         }
       } catch (error: unknown) {
+        metrics.recordLockConflict("outbox", error);
         log("error", "outbox_iteration_failed", {
           errorName: error instanceof Error ? error.name : "UnknownError",
         });
@@ -114,11 +131,10 @@ async function main(): Promise<void> {
     }
   } finally {
     try {
-      if (orm !== undefined) {
-        await orm.close(true);
-      }
+      await metricsServer?.stop(true);
     } finally {
-      client.destroy();
+      try { if (orm !== undefined) await orm.close(true); }
+      finally { client.destroy(); }
     }
   }
 

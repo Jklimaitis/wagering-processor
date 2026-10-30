@@ -8,6 +8,7 @@ import {
   Post,
   Query,
   HttpCode,
+  UseGuards,
 } from "@nestjs/common";
 import {
   InvalidInputError,
@@ -28,8 +29,10 @@ import {
 } from "./infrastructure/database/postgres-financial-reader";
 import { parseLedgerPage } from "./application/ledger-pagination";
 import { MetricsService } from "./metrics.service";
+import { ProviderIdentityGuard } from "./provider-identity.guard";
 
 @Controller("wallets")
+@UseGuards(ProviderIdentityGuard)
 export class WalletsController {
   constructor(
     @Inject(DatabaseService)

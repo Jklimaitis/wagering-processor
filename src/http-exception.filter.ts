@@ -16,28 +16,31 @@ import { InvalidInputError } from "./application/input-validation";
 import { WalletAlreadyExistsError } from "./infrastructure/database/postgres-wallet-creator";
 import { InvalidWagerTransactionError } from "./domain/wager-transaction";
 import { IdempotencyConflictError } from "./infrastructure/database/postgres-wager-processor";
+import type { HttpRequestContext } from "./http-request-context";
+import { MetricsService } from "./metrics.service";
 
 @Catch()
 export class HttpExceptionFilter implements ExceptionFilter<unknown> {
   constructor(
     @Inject(HttpAdapterHost)
     private readonly adapterHost: HttpAdapterHost,
+    @Inject(MetricsService)
+    private readonly metrics: MetricsService,
   ) {}
 
   catch(error: unknown, host: ArgumentsHost): void {
     const http = host.switchToHttp();
 
-    const request = http.getRequest<{
-      headers: Record<string, string | string[] | undefined>;
-    }>();
+    const request = http.getRequest<HttpRequestContext>();
 
     const suppliedCorrelationId = request.headers["x-correlation-id"];
 
     const correlationId =
-      typeof suppliedCorrelationId === "string" &&
+      request.correlationId ??
+      (typeof suppliedCorrelationId === "string" &&
       suppliedCorrelationId.trim() !== ""
         ? suppliedCorrelationId
-        : crypto.randomUUID();
+        : crypto.randomUUID());
 
     let statusCode = 500;
     let code = "INTERNAL_ERROR";
@@ -63,6 +66,8 @@ export class HttpExceptionFilter implements ExceptionFilter<unknown> {
         "40001",
         "57P01",
         "57P03",
+        "40P01",
+        "55P03",
       ].includes(errorCode);
 
     if (error instanceof InvalidInputError) {
@@ -111,6 +116,8 @@ export class HttpExceptionFilter implements ExceptionFilter<unknown> {
       message = "Infraestrutura temporariamente indisponível.";
     }
 
+    this.metrics.recordLockConflict("http", error);
+
     console.log(
       JSON.stringify({
         timestamp: new Date().toISOString(),
@@ -118,6 +125,10 @@ export class HttpExceptionFilter implements ExceptionFilter<unknown> {
         service: "api",
         event: "http_request_failed",
         correlationId,
+        messageId: null,
+        transactionId: request.transactionId ?? null,
+        walletId: request.walletId ?? null,
+        providerId: request.providerId ?? null,
         statusCode,
         code,
         errorName: error instanceof Error ? error.name : "UnknownError",

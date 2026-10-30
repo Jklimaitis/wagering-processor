@@ -25,8 +25,30 @@ import { SqsEventPublisher } from "../../src/infrastructure/messaging/sqs-event-
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { LockMode } from "@mikro-orm/core";
+import { MetricsService } from "../../src/metrics.service";
 
 const schema = `outbox_publisher_${crypto.randomUUID().replaceAll("-", "")}`;
+
+test("outbox lag mede o evento pendente e volta a zero após publicar", async () => {
+  const writer = orm.em.fork({ schema });
+  const record = outboxRecordForTest();
+  record.occurredAt = new Date(Date.now() - 10_000);
+  record.payload.occurredAt = record.occurredAt.toISOString();
+  writer.persist(record);
+  await writer.flush();
+
+  const metrics = new MetricsService();
+  await metrics.refreshOutbox(orm.em.fork({ schema }));
+  const line = (await metrics.render()).split("\n")
+    .find((value) => value.startsWith("wagering_outbox_lag_seconds "));
+  expect(Number(line?.split(" ").at(-1))).toBeGreaterThanOrEqual(9);
+
+  await new PostgresOutboxPublisher(orm.em.fork({ schema }), {
+    publish: async () => {},
+  }).publishNext();
+  await metrics.refreshOutbox(orm.em.fork({ schema }));
+  expect(await metrics.render()).toContain("wagering_outbox_lag_seconds 0");
+});
 
 let orm: MikroORM;
 let schemaCreated = false;
@@ -335,7 +357,7 @@ test("publica o evento da outbox em uma fila FIFO real", async () => {
       new SqsEventPublisher(client, queueUrl),
     );
 
-    expect(await publisher.publishNext()).toEqual({
+    expect(await publisher.publishNext()).toMatchObject({
       status: "PUBLISHED",
       eventId: record.id,
     });
@@ -439,7 +461,7 @@ test("recupera publicação aceita pelo SQS quando a confirmação no banco falh
       transport,
     );
 
-    expect(await restartedPublisher.publishNext()).toEqual({
+    expect(await restartedPublisher.publishNext()).toMatchObject({
       status: "PUBLISHED",
       eventId: record.id,
     });
