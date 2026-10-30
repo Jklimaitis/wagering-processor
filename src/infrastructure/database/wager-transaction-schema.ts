@@ -105,6 +105,27 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
       fieldName: "processed_at",
       nullable: true,
     },
+    referenceAttempts: {
+      type: "integer",
+      fieldName: "reference_attempts",
+      default: 0,
+    },
+    nextReferenceAttemptAt: {
+      type: Date,
+      columnType: "timestamptz",
+      fieldName: "next_reference_attempt_at",
+      nullable: true,
+    },
+    correlationId: {
+      type: "text",
+      fieldName: "correlation_id",
+      nullable: true,
+    },
+    causationId: {
+      type: "text",
+      fieldName: "causation_id",
+      nullable: true,
+    },
   },
 
   uniques: [
@@ -131,6 +152,11 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
     {
       name: "wager_transactions_wallet_created_idx",
       properties: ["walletId", "createdAt", "id"],
+    },
+    {
+      name: "wager_transactions_reference_due_idx",
+      properties: ["nextReferenceAttemptAt", "createdAt", "id"],
+      where: "status = 'PENDING_REFERENCE'",
     },
   ],
 
@@ -195,6 +221,25 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
             and result_currency in ('BRL', 'USD')
           )
         `,
+    },
+    {
+      name: "wager_transactions_reference_attempts_nonnegative",
+      expression: "reference_attempts >= 0",
+    },
+    {
+      name: "wager_transactions_reference_schedule_consistent",
+      expression: `
+        next_reference_attempt_at is null
+        or status = 'PENDING_REFERENCE'
+      `,
+    },
+    {
+      name: "wager_transactions_trace_identifiers_nonempty",
+      expression: `
+        (correlation_id is null or length(trim(correlation_id)) > 0)
+        and
+        (causation_id is null or length(trim(causation_id)) > 0)
+      `,
     },
   ],
 });

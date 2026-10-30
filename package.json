@@ -14,7 +14,8 @@
     "sqs:setup-events": "bun src/scripts/setup-events-queue.ts",
     "worker:outbox": "bun src/workers/outbox-worker.ts",
     "sqs:setup-wagers": "bun src/scripts/setup-wager-queues.ts",
-    "worker:wagers": "bun src/workers/wager-worker.ts"
+    "worker:wagers": "bun src/workers/wager-worker.ts",
+    "worker:references": "bun src/workers/reference-worker.ts"
   },
   "devDependencies": {
     "@mikro-orm/cli": "7.2.0",

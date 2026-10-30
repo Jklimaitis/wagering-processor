@@ -336,6 +336,40 @@
           "enumItems": [],
           "mappedType": "decimal"
         },
+        "causation_id": {
+          "name": "causation_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "correlation_id": {
+          "name": "correlation_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamptz(6)",
@@ -493,6 +527,23 @@
           ],
           "mappedType": "enum"
         },
+        "next_reference_attempt_at": {
+          "name": "next_reference_attempt_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
         "payload_hash": {
           "name": "payload_hash",
           "type": "text",
@@ -560,6 +611,23 @@
           "collation": null,
           "enumItems": [],
           "mappedType": "text"
+        },
+        "reference_attempts": {
+          "name": "reference_attempts",
+          "type": "int",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "0",
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "integer"
         },
         "reference_external_transaction_id": {
           "name": "reference_external_transaction_id",
@@ -745,6 +813,19 @@
         },
         {
           "columnNames": [
+            "next_reference_attempt_at",
+            "created_at",
+            "id"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "wager_transactions_reference_due_idx",
+          "primary": false,
+          "unique": false,
+          "where": "status = 'PENDING_REFERENCE'::text"
+        },
+        {
+          "columnNames": [
             "wallet_id",
             "created_at",
             "id"
@@ -800,10 +881,22 @@
           "columnName": "reference_external_transaction_id"
         },
         {
+          "name": "wager_transactions_reference_attempts_nonnegative",
+          "expression": "reference_attempts >= 0",
+          "definition": "CHECK ((reference_attempts >= 0))",
+          "columnName": "reference_attempts"
+        },
+        {
           "name": "wager_transactions_reference_required",
           "expression": "(kind <> ALL (ARRAY['REFUND'::text, 'ROLLBACK'::text])) OR ((reference_external_transaction_id IS NOT NULL) AND (length(TRIM(BOTH FROM reference_external_transaction_id)) > 0))",
           "definition": "CHECK (((kind <> ALL (ARRAY['REFUND'::text, 'ROLLBACK'::text])) OR ((reference_external_transaction_id IS NOT NULL) AND (length(TRIM(BOTH FROM reference_external_transaction_id)) > 0))))",
           "columnName": "kind"
+        },
+        {
+          "name": "wager_transactions_reference_schedule_consistent",
+          "expression": "(next_reference_attempt_at IS NULL) OR (status = 'PENDING_REFERENCE'::text)",
+          "definition": "CHECK (((next_reference_attempt_at IS NULL) OR (status = 'PENDING_REFERENCE'::text)))",
+          "columnName": "next_reference_attempt_at"
         },
         {
           "name": "wager_transactions_result_balance_valid",
@@ -816,6 +909,12 @@
           "expression": "\"status\" in ('PENDING', 'PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED')",
           "definition": "check (\"status\" in ('PENDING', 'PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED'))",
           "columnName": "status"
+        },
+        {
+          "name": "wager_transactions_trace_identifiers_nonempty",
+          "expression": "((correlation_id IS NULL) OR (length(TRIM(BOTH FROM correlation_id)) > 0)) AND ((causation_id IS NULL) OR (length(TRIM(BOTH FROM causation_id)) > 0))",
+          "definition": "CHECK ((((correlation_id IS NULL) OR (length(TRIM(BOTH FROM correlation_id)) > 0)) AND ((causation_id IS NULL) OR (length(TRIM(BOTH FROM causation_id)) > 0))))",
+          "columnName": "causation_id"
         }
       ],
       "triggers": [],

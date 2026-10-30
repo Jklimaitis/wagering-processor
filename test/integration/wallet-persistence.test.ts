@@ -1015,12 +1015,23 @@ test("reverte a outbox preservando a operação financeira", async () => {
 
   expect(removed[0]?.name).toBeNull();
 
-  const transaction = await reader.findOneOrFail(WagerTransactionRecord, {
-    id: message.aggregateId,
-  });
+  const [transaction] = await reader.execute<
+    { id: string; wallet_id: string }[]
+  >(
+    `
+      select id, wallet_id
+      from "${schema}".wager_transactions
+      where id = ?
+    `,
+    [message.aggregateId],
+  );
+
+  if (transaction === undefined) {
+    throw new Error("Transação financeira desapareceu após a reversão.");
+  }
 
   const wallet = await reader.findOneOrFail(WalletRecord, {
-    id: transaction.walletId,
+    id: transaction.wallet_id,
   });
 
   expect(wallet.balance).toBe("999999999999999999.99");
@@ -1753,4 +1764,144 @@ test("rejeição por saldo insuficiente conclui a inbox", async () => {
   expect(events[0]?.event_type).toBe("WagerTransactionRejected");
 
   await expectLedgerMatchesWallet(wallet.id);
+});
+
+test("persiste agendamento e rastreamento sem reiniciá-los no replay", async () => {
+  const wallet = await emptyWalletForWagerTest();
+
+  const refund = wagerPropsForTest(wallet, {
+    kind: WagerTransactionKind.Refund,
+    referenceExternalTransactionId: crypto.randomUUID(),
+  });
+
+  const context = {
+    correlationId: crypto.randomUUID(),
+    causationId: crypto.randomUUID(),
+  };
+
+  const processor = new PostgresWagerProcessor(orm.em.fork({ schema }));
+  const before = Date.now();
+
+  const result = await processor.process(refund, undefined, context);
+
+  expect(result.status).toBe(WagerTransactionStatus.PendingReference);
+
+  const stored = await orm.em
+    .fork({ schema })
+    .findOneOrFail(WagerTransactionRecord, { id: refund.id });
+
+  expect(stored.referenceAttempts).toBe(0);
+  expect(stored.nextReferenceAttemptAt).not.toBeNull();
+  expect(stored.nextReferenceAttemptAt!.getTime()).toBeGreaterThanOrEqual(
+    before + 1_000,
+  );
+  expect(stored.correlationId).toBe(context.correlationId);
+  expect(stored.causationId).toBe(context.causationId);
+
+  const scheduledAt = stored.nextReferenceAttemptAt;
+
+  const replay = await processor.process(
+    { ...refund, id: crypto.randomUUID() },
+    undefined,
+    { correlationId: crypto.randomUUID() },
+  );
+
+  expect(replay.idempotentReplay).toBe(true);
+
+  const after = await orm.em
+    .fork({ schema })
+    .findOneOrFail(WagerTransactionRecord, { id: refund.id });
+
+  expect(after.referenceAttempts).toBe(0);
+  expect(after.nextReferenceAttemptAt).toEqual(scheduledAt);
+  expect(after.correlationId).toBe(context.correlationId);
+  expect(after.causationId).toBe(context.causationId);
+
+  expect(await outboxEventsForTransaction(refund.id)).toHaveLength(1);
+
+  await expectLedgerMatchesWallet(wallet.id);
+});
+
+test.each([
+  {
+    assignment: "reference_attempts = -1",
+    constraint: "wager_transactions_reference_attempts_nonnegative",
+  },
+  {
+    assignment: "next_reference_attempt_at = now()",
+    constraint: "wager_transactions_reference_schedule_consistent",
+  },
+  {
+    assignment: "correlation_id = '   '",
+    constraint: "wager_transactions_trace_identifiers_nonempty",
+  },
+  {
+    assignment: "causation_id = ''",
+    constraint: "wager_transactions_trace_identifiers_nonempty",
+  },
+])("protege os metadados de referência: %j", async (scenario) => {
+  const { funding } = await inboxScenarioForTest();
+
+  await expect(
+    orm.em.fork().execute(
+      `
+        update "${schema}".wager_transactions
+        set ${scenario.assignment}
+        where id = ?
+      `,
+      [funding.id],
+    ),
+  ).rejects.toMatchObject({
+    code: "23514",
+    constraint: scenario.constraint,
+  });
+});
+
+test("reverte e reaplica metadados preservando finanças e eventos", async () => {
+  const { walletId, funding } = await inboxScenarioForTest();
+
+  const eventsBefore = await outboxEventsForTransaction(funding.id);
+
+  await orm.migrator.down({
+    schema,
+    to: "Migration20261029000500",
+  });
+
+  try {
+    const rows = await orm.em
+      .fork()
+      .execute<{ id: string; amount: string; status: string }[]>(
+        `
+        select id, amount, status
+        from "${schema}".wager_transactions
+        where id = ?
+      `,
+        [funding.id],
+      );
+
+    expect(rows[0]?.id).toBe(funding.id);
+    expect(rows[0]?.amount).toBe("100.00");
+    expect(rows[0]?.status).toBe("PROCESSED");
+
+    expect(await outboxEventsForTransaction(funding.id)).toEqual(eventsBefore);
+
+    await expectLedgerMatchesWallet(walletId);
+  } finally {
+    await orm.migrator.up({ schema });
+  }
+
+  const restored = await orm.em
+    .fork({ schema })
+    .findOneOrFail(WagerTransactionRecord, { id: funding.id });
+
+  expect(restored.referenceAttempts).toBe(0);
+  expect(restored.nextReferenceAttemptAt).toBeNull();
+  expect(restored.correlationId).toBeNull();
+  expect(restored.causationId).toBeNull();
+
+  const wallet = await orm.em
+    .fork({ schema })
+    .findOneOrFail(WalletRecord, { id: walletId });
+
+  expect(wallet.balance).toBe("100.00");
 });

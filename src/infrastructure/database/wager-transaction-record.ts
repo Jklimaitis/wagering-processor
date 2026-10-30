@@ -28,4 +28,8 @@ export class WagerTransactionRecord {
   failureCode!: FailureCode | null;
   createdAt!: Date;
   processedAt!: Date | null;
+  referenceAttempts = 0;
+  nextReferenceAttemptAt: Date | null = null;
+  correlationId: string | null = null;
+  causationId: string | null = null;
 }
