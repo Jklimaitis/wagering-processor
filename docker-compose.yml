@@ -1,5 +1,22 @@
-# Infra local do desafio. Suba com: docker compose up -d
-# Portas: 15433 (Postgres, porque a 5432 do host ja esta ocupada) e 4566 (LocalStack/SQS)
+x-app: &app
+  build: .
+  image: wagering-processor:local
+  stop_grace_period: 30s
+  environment: &environment
+    DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
+    DATABASE_SCHEMA: public
+    AWS_ENDPOINT_URL: http://localstack:4566
+    AWS_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    SQS_QUEUE_NAME: wager-transactions.fifo
+    SQS_DLQ_NAME: wager-transactions-dlq.fifo
+    SQS_EVENTS_QUEUE_NAME: wager-events.fifo
+    METRICS_PORT: "3001"
+
+x-ready: &ready
+  setup:
+    condition: service_completed_successfully
 
 services:
   postgres:
@@ -32,6 +49,63 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  setup:
+    <<: *app
+    command: ["bun", "run", "setup"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["bun", "run", "start"]
+    depends_on: *ready
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r = await fetch('http://127.0.0.1:3000/health/ready'); process.exit(r.ok ? 0 : 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  wager-worker:
+    <<: *app
+    command: ["bun", "run", "worker:wagers"]
+    depends_on: *ready
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1::3001"
+
+  outbox-worker:
+    <<: *app
+    command: ["bun", "run", "worker:outbox"]
+    depends_on: *ready
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1::3001"
+
+  reference-worker:
+    <<: *app
+    command: ["bun", "run", "worker:references"]
+    depends_on: *ready
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1::3001"
+
+  tests:
+    <<: *app
+    profiles: ["test"]
+    command: ["bun", "run", "check"]
+    depends_on: *ready
+    environment:
+      <<: *environment
+      METRICS_PORT: "0"
+      API_URL: http://api:3000
 
 volumes:
   pgdata:
