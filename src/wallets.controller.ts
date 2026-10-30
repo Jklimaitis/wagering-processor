@@ -1,4 +1,12 @@
-import { Body, Controller, Headers, Inject, Post } from "@nestjs/common";
+import {
+  Body,
+  Controller,
+  Get,
+  Headers,
+  Inject,
+  Param,
+  Post,
+} from "@nestjs/common";
 import {
   InvalidInputError,
   readObject,
@@ -11,6 +19,7 @@ import {
   PostgresWalletCreator,
   type WalletView,
 } from "./infrastructure/database/postgres-wallet-creator";
+import { PostgresFinancialReader } from "./infrastructure/database/postgres-financial-reader";
 
 @Controller("wallets")
 export class WalletsController {
@@ -18,6 +27,13 @@ export class WalletsController {
     @Inject(DatabaseService)
     private readonly database: DatabaseService,
   ) {}
+
+  @Get(":walletId")
+  async findOne(@Param("walletId") walletId: unknown): Promise<WalletView> {
+    return new PostgresFinancialReader(this.database.em).findWallet(
+      readUuid(walletId, "walletId"),
+    );
+  }
 
   @Post()
   async create(

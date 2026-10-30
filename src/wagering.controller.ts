@@ -1,5 +1,14 @@
-import { Body, Controller, Headers, Inject, Post, Res } from "@nestjs/common";
-import { readString } from "./application/input-validation";
+import {
+  Body,
+  Controller,
+  Get,
+  Headers,
+  Inject,
+  Param,
+  Post,
+  Res,
+} from "@nestjs/common";
+import { readString, readUuid } from "./application/input-validation";
 import { parseWagerRequest } from "./application/parse-wager-request";
 import { WagerTransactionStatus } from "./domain/wager-transaction";
 import { DatabaseService } from "./infrastructure/database/database.service";
@@ -7,6 +16,10 @@ import {
   PostgresWagerProcessor,
   type PostgresWagerResult,
 } from "./infrastructure/database/postgres-wager-processor";
+import {
+  PostgresFinancialReader,
+  type WagerTransactionView,
+} from "./infrastructure/database/postgres-financial-reader";
 
 const HTTP_STATUS_BY_STATE: Record<WagerTransactionStatus, number> = {
   [WagerTransactionStatus.Pending]: 202,
@@ -22,6 +35,15 @@ export class WageringController {
     @Inject(DatabaseService)
     private readonly database: DatabaseService,
   ) {}
+
+  @Get(":transactionId")
+  async findOne(
+    @Param("transactionId") transactionId: unknown,
+  ): Promise<WagerTransactionView> {
+    return new PostgresFinancialReader(this.database.em).findTransactionById(
+      readUuid(transactionId, "transactionId"),
+    );
+  }
 
   @Post()
   async process(

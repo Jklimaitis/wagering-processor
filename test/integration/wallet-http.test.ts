@@ -20,6 +20,7 @@ import { WalletRecord } from "../../src/infrastructure/database/wallet-record";
 import { WalletsController } from "../../src/wallets.controller";
 import { WageringController } from "../../src/wagering.controller";
 import type { PostgresWagerResult } from "../../src/infrastructure/database/postgres-wager-processor";
+import { ProviderTransactionsController } from "../../src/provider-transactions.controller";
 
 const schema = `wallet_http_${crypto.randomUUID().replaceAll("-", "")}`;
 
@@ -28,7 +29,11 @@ let app: INestApplication | undefined;
 let baseUrl = "";
 
 @Module({
-  controllers: [WalletsController, WageringController],
+  controllers: [
+    WalletsController,
+    WageringController,
+    ProviderTransactionsController,
+  ],
   providers: [
     {
       provide: DatabaseService,
@@ -554,3 +559,130 @@ test("wallet inexistente retorna 404 sem persistir efeitos", async () => {
 
   expect(await counts()).toEqual(before);
 });
+
+test("consultas preservam saldo observado e distinguem provedores", async () => {
+  const wallet = await createFundedWallet();
+  const externalTransactionId = `tx/${crypto.randomUUID()}`;
+
+  const betResponse = await postWager(
+    {
+      ...wagerRequest(wallet),
+      providerId: "query-provider-a",
+      externalTransactionId,
+    },
+    `http:${crypto.randomUUID()}`,
+  );
+
+  expect(betResponse.status).toBe(200);
+
+  const bet = (await betResponse.json()) as PostgresWagerResult;
+
+  const winResponse = await postWager(
+    {
+      ...wagerRequest(wallet),
+      providerId: "query-provider-b",
+      externalTransactionId,
+      kind: WagerTransactionKind.Win,
+      money: { amount: "10.00", currency: "BRL" },
+    },
+    `http:${crypto.randomUUID()}`,
+  );
+
+  expect(winResponse.status).toBe(200);
+
+  const win = (await winResponse.json()) as PostgresWagerResult;
+  const beforeQueries = await counts();
+
+  const walletResponse = await fetch(`${baseUrl}/wallets/${wallet.id}`);
+
+  expect(walletResponse.status).toBe(200);
+  expect(await walletResponse.json()).toEqual({
+    id: wallet.id,
+    playerId: wallet.playerId,
+    balance: { amount: "85.00", currency: "BRL" },
+    version: 3,
+  });
+
+  const transactionResponse = await fetch(
+    `${baseUrl}/wagering/transactions/${bet.transactionId}`,
+  );
+
+  expect(transactionResponse.status).toBe(200);
+
+  const transaction = await transactionResponse.json();
+
+  expect(transaction).toMatchObject({
+    transactionId: bet.transactionId,
+    providerId: "query-provider-a",
+    externalTransactionId,
+    walletId: wallet.id,
+    playerId: wallet.playerId,
+    kind: WagerTransactionKind.Bet,
+    money: { amount: "25.00", currency: "BRL" },
+    status: WagerTransactionStatus.Processed,
+    balance: { amount: "75.00", currency: "BRL" },
+    failureCode: null,
+    referenceExternalTransactionId: null,
+    referenceTransactionId: null,
+    createdAt: expect.any(String),
+    processedAt: expect.any(String),
+  });
+
+  expect(transaction).not.toHaveProperty("payloadHash");
+  expect(transaction).not.toHaveProperty("idempotencyKey");
+
+  const externalId = encodeURIComponent(externalTransactionId);
+
+  const providerAResponse = await fetch(
+    `${baseUrl}/providers/query-provider-a/wagering/transactions/${externalId}`,
+  );
+
+  expect(providerAResponse.status).toBe(200);
+  expect(await providerAResponse.json()).toEqual(transaction);
+
+  const providerBResponse = await fetch(
+    `${baseUrl}/providers/query-provider-b/wagering/transactions/${externalId}`,
+  );
+
+  expect(providerBResponse.status).toBe(200);
+  expect(await providerBResponse.json()).toMatchObject({
+    transactionId: win.transactionId,
+    providerId: "query-provider-b",
+    externalTransactionId,
+    kind: WagerTransactionKind.Win,
+    money: { amount: "10.00", currency: "BRL" },
+    balance: { amount: "85.00", currency: "BRL" },
+  });
+
+  expect(await counts()).toEqual(beforeQueries);
+  await expectLedgerBalance(wallet.id, "85.00");
+});
+
+test.each([
+  `/wallets/${crypto.randomUUID()}`,
+  `/wagering/transactions/${crypto.randomUUID()}`,
+  `/providers/missing-provider/wagering/transactions/${crypto.randomUUID()}`,
+])("consulta inexistente retorna 404: %s", async (path) => {
+  const response = await fetch(`${baseUrl}${path}`);
+
+  expect(response.status).toBe(404);
+  expect(await response.json()).toMatchObject({
+    code: "NOT_FOUND",
+  });
+});
+
+test.each([
+  ["/wallets/not-a-uuid", "walletId"],
+  ["/wagering/transactions/not-a-uuid", "transactionId"],
+] as const)(
+  "consulta com UUID inválido retorna 400: %s",
+  async (path, field) => {
+    const response = await fetch(`${baseUrl}${path}`);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      code: "INVALID_INPUT",
+      field,
+    });
+  },
+);
