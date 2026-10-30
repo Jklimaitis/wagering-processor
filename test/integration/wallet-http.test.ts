@@ -37,6 +37,11 @@ import type { LedgerPageView } from "../../src/infrastructure/database/postgres-
 import { MetricsController } from "../../src/metrics.controller";
 import { MetricsService } from "../../src/metrics.service";
 import { Money } from "../../src/domain/money";
+import { CreateQueueCommand, DeleteQueueCommand } from "@aws-sdk/client-sqs";
+import { setTimeout as delay } from "node:timers/promises";
+import { HealthController } from "../../src/health.controller";
+import { ReadinessService } from "../../src/readiness.service";
+import { createSqsClient } from "../../src/infrastructure/messaging/sqs-client";
 
 const schema = `wallet_http_${crypto.randomUUID().replaceAll("-", "")}`;
 
@@ -44,8 +49,17 @@ let orm: MikroORM;
 let app: INestApplication | undefined;
 let baseUrl = "";
 
+const sqsAdmin = createSqsClient();
+
+const healthQueueNames = ["wagers", "dlq", "events"].map(
+  (name) => `health-${name}-${crypto.randomUUID()}.fifo`,
+);
+
+const healthQueueUrls: string[] = [];
+
 @Module({
   controllers: [
+    HealthController,
     WalletsController,
     WageringController,
     ProviderTransactionsController,
@@ -56,6 +70,12 @@ let baseUrl = "";
     {
       provide: DatabaseService,
       useFactory: () => new DatabaseService({ ...config, schema }),
+    },
+    {
+      provide: ReadinessService,
+      inject: [DatabaseService],
+      useFactory: (database: DatabaseService) =>
+        new ReadinessService(database, createSqsClient(), healthQueueNames),
     },
     {
       provide: APP_FILTER,
@@ -79,6 +99,27 @@ beforeAll(async () => {
   await orm.em.fork().execute(`create schema "${schema}"`);
   await orm.migrator.up({ schema });
 
+  for (const name of healthQueueNames) {
+    const created = await sqsAdmin.send(
+      new CreateQueueCommand({
+        QueueName: name,
+        Attributes: {
+          FifoQueue: "true",
+          ContentBasedDeduplication: "false",
+        },
+      }),
+      { abortSignal: AbortSignal.timeout(10_000) },
+    );
+
+    if (created.QueueUrl === undefined) {
+      throw new Error("SQS não retornou a URL da fila de health.");
+    }
+
+    healthQueueUrls.push(created.QueueUrl);
+  }
+
+  await delay(1_000);
+
   app = await NestFactory.create(TestModule, {
     logger: false,
     abortOnError: false,
@@ -92,13 +133,23 @@ afterAll(async () => {
   try {
     await app?.close();
   } finally {
-    if (orm) {
-      try {
-        await orm.em
-          .fork()
-          .execute(`drop schema if exists "${schema}" cascade`);
-      } finally {
-        await orm.close(true);
+    try {
+      for (const queueUrl of healthQueueUrls) {
+        await sqsAdmin.send(new DeleteQueueCommand({ QueueUrl: queueUrl }), {
+          abortSignal: AbortSignal.timeout(10_000),
+        });
+      }
+    } finally {
+      sqsAdmin.destroy();
+
+      if (orm) {
+        try {
+          await orm.em
+            .fork()
+            .execute(`drop schema if exists "${schema}" cascade`);
+        } finally {
+          await orm.close(true);
+        }
       }
     }
   }
@@ -1193,3 +1244,83 @@ test("reconciliação lê estado confirmado enquanto uma aposta aguarda commit",
 
   await expectLedgerBalance(wallet.id, "75.00");
 }, 10_000);
+
+async function expectHealth(
+  path: "live" | "ready",
+  status: number,
+  body: unknown,
+): Promise<void> {
+  const response = await fetch(`${baseUrl}/health/${path}`, {
+    signal: AbortSignal.timeout(5_000),
+  });
+
+  expect(response.status).toBe(status);
+  expect(await response.json()).toEqual(body);
+}
+
+test("health distingue processo vivo de dependências prontas", async () => {
+  if (app === undefined) {
+    throw new Error("Aplicação de teste não inicializada.");
+  }
+
+  const before = await counts();
+
+  await expectHealth("live", 200, { status: "ok" });
+
+  await expectHealth("ready", 200, {
+    status: "ok",
+    checks: {
+      postgres: "up",
+      sqs: "up",
+    },
+  });
+
+  const database = app.get(DatabaseService);
+
+  // Fecha somente o pool pertencente à API de teste.
+  await database.onModuleDestroy();
+
+  try {
+    await expectHealth("ready", 503, {
+      status: "error",
+      checks: {
+        postgres: "down",
+        sqs: "up",
+      },
+    });
+
+    await expectHealth("live", 200, { status: "ok" });
+  } finally {
+    await database.onModuleInit();
+  }
+
+  await expectHealth("ready", 200, {
+    status: "ok",
+    checks: {
+      postgres: "up",
+      sqs: "up",
+    },
+  });
+
+  const queueUrl = healthQueueUrls.pop();
+
+  if (queueUrl === undefined) {
+    throw new Error("Fila exclusiva de health ausente.");
+  }
+
+  await sqsAdmin.send(new DeleteQueueCommand({ QueueUrl: queueUrl }), {
+    abortSignal: AbortSignal.timeout(10_000),
+  });
+
+  await expectHealth("ready", 503, {
+    status: "error",
+    checks: {
+      postgres: "up",
+      sqs: "down",
+    },
+  });
+
+  await expectHealth("live", 200, { status: "ok" });
+
+  expect(await counts()).toEqual(before);
+}, 15_000);
