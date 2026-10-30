@@ -6,6 +6,8 @@ import { DatabaseService } from "./infrastructure/database/database.service";
 import { WalletsController } from "./wallets.controller";
 import { WageringController } from "./wagering.controller";
 import { ProviderTransactionsController } from "./provider-transactions.controller";
+import { MetricsController } from "./metrics.controller";
+import { MetricsService } from "./metrics.service";
 
 @Module({
   controllers: [
@@ -13,8 +15,10 @@ import { ProviderTransactionsController } from "./provider-transactions.controll
     WalletsController,
     WageringController,
     ProviderTransactionsController,
+    MetricsController,
   ],
   providers: [
+    MetricsService,
     {
       provide: DatabaseService,
       useFactory: () => new DatabaseService(),

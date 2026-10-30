@@ -1,4 +1,5 @@
 import type { EntityManager } from "@mikro-orm/postgresql";
+
 import type { MoneyProps } from "../../domain/money";
 import type {
   FailureCode,
@@ -8,7 +9,7 @@ import type {
 import type { WalletView } from "./postgres-wallet-creator";
 import { WagerTransactionRecord } from "./wager-transaction-record";
 import { WalletRecord } from "./wallet-record";
-import { QueryOrder } from "@mikro-orm/core";
+import { NotFoundError, QueryOrder } from "@mikro-orm/core";
 import { InvalidInputError } from "../../application/input-validation";
 import {
   encodeLedgerCursor,
@@ -52,6 +53,25 @@ export interface LedgerPageView {
   nextCursor: string | null;
 }
 
+export interface ReconciliationView {
+  walletId: string;
+  storedBalance: MoneyProps;
+  calculatedBalance: MoneyProps;
+  difference: MoneyProps;
+  consistent: boolean;
+  checkedEntries: number;
+}
+
+interface ReconciliationRow {
+  walletId: string;
+  currency: string;
+  storedBalance: string;
+  calculatedBalance: string;
+  difference: string;
+  consistent: boolean;
+  checkedEntries: string;
+}
+
 export class PostgresFinancialReader {
   constructor(private readonly em: EntityManager) {}
 
@@ -93,9 +113,7 @@ export class PostgresFinancialReader {
     return this.transactionView(record);
   }
 
-    async listLedger(
-    request: LedgerPageRequest,
-  ): Promise<LedgerPageView> {
+  async listLedger(request: LedgerPageRequest): Promise<LedgerPageView> {
     const { walletId, limit, afterEntryId } = request;
 
     await this.em.findOneOrFail(
@@ -174,6 +192,74 @@ export class PostgresFinancialReader {
         records.length > limit && last !== undefined
           ? encodeLedgerCursor(walletId, last.id)
           : null,
+    };
+  }
+
+  async reconcileWallet(walletId: string): Promise<ReconciliationView> {
+    const namespace = this.em
+      .getPlatform()
+      .quoteIdentifier(
+        this.em.schema ?? this.em.config.get("schema") ?? "public",
+      );
+
+    const [row] = await this.em.execute<ReconciliationRow[]>(
+      `
+        with ledger_totals as (
+          select
+            coalesce(
+              sum(
+                case
+                  when direction = 'CREDIT' then amount
+                  else -amount
+                end
+              ),
+              0
+            ) as balance,
+            count(*)::text as checked_entries
+          from ${namespace}.wallet_ledger_entries
+          where wallet_id = ?
+        )
+        select
+          w.id as "walletId",
+          w.currency,
+          w.balance::text as "storedBalance",
+          round(t.balance, 2)::text as "calculatedBalance",
+          round(w.balance - t.balance, 2)::text as difference,
+          w.balance = t.balance as consistent,
+          t.checked_entries as "checkedEntries"
+        from ${namespace}.wallets w
+        cross join ledger_totals t
+        where w.id = ?
+      `,
+      [walletId, walletId],
+    );
+
+    if (row === undefined) {
+      throw NotFoundError.findOneFailed(WalletRecord.name, { id: walletId });
+    }
+
+    const checkedEntries = Number(row.checkedEntries);
+
+    if (!Number.isSafeInteger(checkedEntries) || checkedEntries < 0) {
+      throw new Error("Contagem do ledger fora do intervalo suportado.");
+    }
+
+    return {
+      walletId: row.walletId,
+      storedBalance: {
+        amount: row.storedBalance,
+        currency: row.currency,
+      },
+      calculatedBalance: {
+        amount: row.calculatedBalance,
+        currency: row.currency,
+      },
+      difference: {
+        amount: row.difference,
+        currency: row.currency,
+      },
+      consistent: row.consistent,
+      checkedEntries,
     };
   }
 

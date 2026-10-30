@@ -7,6 +7,7 @@ import {
   Param,
   Post,
   Query,
+  HttpCode,
 } from "@nestjs/common";
 import {
   InvalidInputError,
@@ -23,14 +24,18 @@ import {
 import {
   PostgresFinancialReader,
   type LedgerPageView,
+  type ReconciliationView,
 } from "./infrastructure/database/postgres-financial-reader";
 import { parseLedgerPage } from "./application/ledger-pagination";
+import { MetricsService } from "./metrics.service";
 
 @Controller("wallets")
 export class WalletsController {
   constructor(
     @Inject(DatabaseService)
     private readonly database: DatabaseService,
+    @Inject(MetricsService)
+    private readonly metrics: MetricsService,
   ) {}
 
   @Get(":walletId")
@@ -50,7 +55,44 @@ export class WalletsController {
       parseLedgerPage(walletId, cursor, limit),
     );
   }
-  
+
+  @Post(":walletId/reconciliation")
+  @HttpCode(200)
+  async reconcile(
+    @Param("walletId") walletIdValue: unknown,
+    @Headers("x-correlation-id") correlationHeader: unknown,
+  ): Promise<ReconciliationView> {
+    const walletId = readUuid(walletIdValue, "walletId");
+
+    const correlationId =
+      correlationHeader === undefined
+        ? crypto.randomUUID()
+        : readString(correlationHeader, "x-correlation-id");
+
+    const report = await new PostgresFinancialReader(
+      this.database.em,
+    ).reconcileWallet(walletId);
+
+    this.metrics.recordReconciliation(report.consistent);
+
+    console.log(
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        level: report.consistent ? "info" : "error",
+        service: "api",
+        event: report.consistent
+          ? "wallet_reconciled"
+          : "wallet_reconciliation_mismatch",
+        correlationId,
+        walletId,
+        consistent: report.consistent,
+        checkedEntries: report.checkedEntries,
+      }),
+    );
+
+    return report;
+  }
+
   @Post()
   async create(
     @Body() body: unknown,

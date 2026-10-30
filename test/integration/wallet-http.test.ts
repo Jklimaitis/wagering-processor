@@ -1,5 +1,12 @@
 import "reflect-metadata";
-import { afterAll, beforeAll, expect, setSystemTime, test } from "bun:test";
+import {
+  afterAll,
+  beforeAll,
+  expect,
+  setSystemTime,
+  spyOn,
+  test,
+} from "bun:test";
 import { Module, type INestApplication } from "@nestjs/common";
 import { APP_FILTER, NestFactory } from "@nestjs/core";
 import { MikroORM } from "@mikro-orm/postgresql";
@@ -19,11 +26,17 @@ import { WalletLedgerEntryRecord } from "../../src/infrastructure/database/walle
 import { WalletRecord } from "../../src/infrastructure/database/wallet-record";
 import { WalletsController } from "../../src/wallets.controller";
 import { WageringController } from "../../src/wagering.controller";
-import type { PostgresWagerResult } from "../../src/infrastructure/database/postgres-wager-processor";
+import {
+  PostgresWagerProcessor,
+  type PostgresWagerResult,
+} from "../../src/infrastructure/database/postgres-wager-processor";
 import { ProviderTransactionsController } from "../../src/provider-transactions.controller";
 import { QueryOrder } from "@mikro-orm/core";
 import { encodeLedgerCursor } from "../../src/application/ledger-pagination";
 import type { LedgerPageView } from "../../src/infrastructure/database/postgres-financial-reader";
+import { MetricsController } from "../../src/metrics.controller";
+import { MetricsService } from "../../src/metrics.service";
+import { Money } from "../../src/domain/money";
 
 const schema = `wallet_http_${crypto.randomUUID().replaceAll("-", "")}`;
 
@@ -36,8 +49,10 @@ let baseUrl = "";
     WalletsController,
     WageringController,
     ProviderTransactionsController,
+    MetricsController,
   ],
   providers: [
+    MetricsService,
     {
       provide: DatabaseService,
       useFactory: () => new DatabaseService({ ...config, schema }),
@@ -878,3 +893,303 @@ test("rejeita limites inválidos e cursores incompatíveis", async () => {
   await expectLedgerBalance(origin.id, "101.00");
   await expectLedgerBalance(target.id, "100.00");
 });
+
+function requestReconciliation(walletId: string, signal?: AbortSignal) {
+  return fetch(`${baseUrl}/wallets/${walletId}/reconciliation`, {
+    method: "POST",
+    headers: {
+      "x-correlation-id": "reconciliation-test",
+    },
+    signal,
+  });
+}
+
+async function reconciliationMetric(
+  result: "consistent" | "inconsistent",
+): Promise<number> {
+  const response = await fetch(`${baseUrl}/metrics`);
+
+  expect(response.status).toBe(200);
+  expect(response.headers.get("content-type")).toContain("text/plain");
+
+  const text = await response.text();
+
+  const sample = text
+    .split("\n")
+    .find((line) =>
+      line.startsWith(`wagering_reconciliations_total{result="${result}"} `),
+    );
+
+  if (sample === undefined) {
+    throw new Error(`Métrica de reconciliação ausente: ${result}`);
+  }
+
+  const value = Number(sample.slice(sample.lastIndexOf(" ") + 1));
+
+  expect(Number.isSafeInteger(value)).toBe(true);
+
+  return value;
+}
+
+test.each([
+  ["0.00", "0.00", 0],
+  ["100.00", "75.00", 2],
+] as const)(
+  "reconcilia saldo inicial %s sem alterar dados",
+  async (initialBalance, expectedBalance, checkedEntries) => {
+    const created = await postWallet(crypto.randomUUID(), initialBalance);
+
+    expect(created.status).toBe(201);
+
+    const wallet = (await created.json()) as WalletView;
+
+    if (initialBalance === "100.00") {
+      const bet = await postWager(
+        wagerRequest(wallet),
+        `http:${crypto.randomUUID()}`,
+      );
+
+      expect(bet.status).toBe(200);
+    }
+
+    const before = await counts();
+
+    const beforeWallet = await orm.em
+      .fork()
+      .findOneOrFail(WalletRecord, { id: wallet.id });
+
+    const metricBefore = await reconciliationMetric("consistent");
+
+    const response = await requestReconciliation(wallet.id);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      walletId: wallet.id,
+      storedBalance: {
+        amount: expectedBalance,
+        currency: "BRL",
+      },
+      calculatedBalance: {
+        amount: expectedBalance,
+        currency: "BRL",
+      },
+      difference: {
+        amount: "0.00",
+        currency: "BRL",
+      },
+      consistent: true,
+      checkedEntries,
+    });
+
+    const afterWallet = await orm.em
+      .fork()
+      .findOneOrFail(WalletRecord, { id: wallet.id });
+
+    expect(afterWallet.balance).toBe(beforeWallet.balance);
+    expect(afterWallet.version).toBe(beforeWallet.version);
+    expect(afterWallet.updatedAt.getTime()).toBe(
+      beforeWallet.updatedAt.getTime(),
+    );
+
+    expect(await counts()).toEqual(before);
+
+    expect(await reconciliationMetric("consistent")).toBe(metricBefore + 1);
+
+    await expectLedgerBalance(wallet.id, expectedBalance);
+  },
+);
+
+test.each([
+  ["74.99", "-0.01"],
+  ["75.01", "0.01"],
+] as const)(
+  "detecta saldo divergente %s, registra métrica e preserva os dados",
+  async (corruptedBalance, difference) => {
+    const wallet = await createFundedWallet();
+
+    const bet = await postWager(
+      wagerRequest(wallet),
+      `http:${crypto.randomUUID()}`,
+    );
+
+    expect(bet.status).toBe(200);
+
+    // Simula corrupção do saldo materializado no schema do teste.
+    await orm.em
+      .fork()
+      .nativeUpdate(
+        WalletRecord,
+        { id: wallet.id },
+        { balance: corruptedBalance },
+      );
+
+    const before = await counts();
+    const metricBefore = await reconciliationMetric("inconsistent");
+    const lines: string[] = [];
+
+    const logSpy = spyOn(console, "log").mockImplementation(
+      (...values: unknown[]) => {
+        for (const value of values) {
+          if (typeof value === "string") {
+            lines.push(value);
+          }
+        }
+      },
+    );
+
+    try {
+      const response = await requestReconciliation(wallet.id);
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        walletId: wallet.id,
+        storedBalance: {
+          amount: corruptedBalance,
+          currency: "BRL",
+        },
+        calculatedBalance: {
+          amount: "75.00",
+          currency: "BRL",
+        },
+        difference: {
+          amount: difference,
+          currency: "BRL",
+        },
+        consistent: false,
+        checkedEntries: 2,
+      });
+
+      const stored = await orm.em
+        .fork()
+        .findOneOrFail(WalletRecord, { id: wallet.id });
+
+      expect(stored.balance).toBe(corruptedBalance);
+      expect(stored.version).toBe(2);
+      expect(await counts()).toEqual(before);
+
+      expect(await reconciliationMetric("inconsistent")).toBe(metricBefore + 1);
+
+      const event = lines
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .find(
+          (entry) =>
+            entry.event === "wallet_reconciliation_mismatch" &&
+            entry.walletId === wallet.id,
+        );
+
+      expect(event).toMatchObject({
+        level: "error",
+        correlationId: "reconciliation-test",
+        walletId: wallet.id,
+        consistent: false,
+        checkedEntries: 2,
+      });
+
+      expect(event).not.toHaveProperty("storedBalance");
+      expect(event).not.toHaveProperty("calculatedBalance");
+      expect(event).not.toHaveProperty("difference");
+    } finally {
+      logSpy.mockRestore();
+
+      await orm.em
+        .fork()
+        .nativeUpdate(WalletRecord, { id: wallet.id }, { balance: "75.00" });
+    }
+
+    await expectLedgerBalance(wallet.id, "75.00");
+  },
+);
+
+test.each([
+  [crypto.randomUUID(), 404, "NOT_FOUND"],
+  ["not-a-uuid", 400, "INVALID_INPUT"],
+] as const)(
+  "reconciliação inválida retorna HTTP %s",
+  async (walletId, status, code) => {
+    const before = await Promise.all([
+      reconciliationMetric("consistent"),
+      reconciliationMetric("inconsistent"),
+    ]);
+
+    const response = await requestReconciliation(walletId);
+
+    expect(response.status).toBe(status);
+    expect(await response.json()).toMatchObject({ code });
+
+    expect(
+      await Promise.all([
+        reconciliationMetric("consistent"),
+        reconciliationMetric("inconsistent"),
+      ]),
+    ).toEqual(before);
+  },
+);
+
+test("reconciliação lê estado confirmado enquanto uma aposta aguarda commit", async () => {
+  const wallet = await createFundedWallet();
+
+  let notifyReady!: () => void;
+  let release!: () => void;
+
+  const ready = new Promise<void>((resolve) => {
+    notifyReady = resolve;
+  });
+
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  const transaction = orm.em.fork().transactional(async (em) => {
+    const result = await new PostgresWagerProcessor(em).process({
+      ...wagerRequest(wallet),
+      id: crypto.randomUUID(),
+      idempotencyKey: `http:${crypto.randomUUID()}`,
+      money: Money.from({
+        amount: "25.00",
+        currency: "BRL",
+      }),
+    });
+
+    expect(result.status).toBe(WagerTransactionStatus.Processed);
+
+    notifyReady();
+    await gate;
+  });
+
+  try {
+    await Promise.race([
+      ready,
+      transaction.then(() => {
+        throw new Error("Transação terminou antes da barreira.");
+      }),
+    ]);
+
+    const response = await requestReconciliation(
+      wallet.id,
+      AbortSignal.timeout(2_000),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      storedBalance: { amount: "100.00", currency: "BRL" },
+      calculatedBalance: { amount: "100.00", currency: "BRL" },
+      consistent: true,
+      checkedEntries: 1,
+    });
+  } finally {
+    release();
+    await transaction;
+  }
+
+  const response = await requestReconciliation(wallet.id);
+
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({
+    storedBalance: { amount: "75.00", currency: "BRL" },
+    calculatedBalance: { amount: "75.00", currency: "BRL" },
+    consistent: true,
+    checkedEntries: 2,
+  });
+
+  await expectLedgerBalance(wallet.id, "75.00");
+}, 10_000);
