@@ -2,6 +2,7 @@ import {
   ConnectionException,
   DeadlockException,
   LockWaitTimeoutException,
+  NotFoundError,
 } from "@mikro-orm/core";
 import {
   Catch,
@@ -13,6 +14,8 @@ import {
 import { HttpAdapterHost } from "@nestjs/core";
 import { InvalidInputError } from "./application/input-validation";
 import { WalletAlreadyExistsError } from "./infrastructure/database/postgres-wallet-creator";
+import { InvalidWagerTransactionError } from "./domain/wager-transaction";
+import { IdempotencyConflictError } from "./infrastructure/database/postgres-wager-processor";
 
 @Catch()
 export class HttpExceptionFilter implements ExceptionFilter<unknown> {
@@ -67,10 +70,21 @@ export class HttpExceptionFilter implements ExceptionFilter<unknown> {
       code = error.code;
       message = error.message;
       field = error.field;
-    } else if (error instanceof WalletAlreadyExistsError) {
+    } else if (error instanceof InvalidWagerTransactionError) {
+      statusCode = 400;
+      code = "INVALID_OPERATION";
+      message = error.message;
+    } else if (
+      error instanceof WalletAlreadyExistsError ||
+      error instanceof IdempotencyConflictError
+    ) {
       statusCode = 409;
       code = error.code;
       message = error.message;
+    } else if (error instanceof NotFoundError) {
+      statusCode = 404;
+      code = "NOT_FOUND";
+      message = "Recurso não encontrado.";
     } else if (error instanceof HttpException) {
       statusCode = error.getStatus();
       code =

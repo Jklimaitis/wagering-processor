@@ -4,6 +4,7 @@ import { Module, type INestApplication } from "@nestjs/common";
 import { APP_FILTER, NestFactory } from "@nestjs/core";
 import { MikroORM } from "@mikro-orm/postgresql";
 import {
+  FailureCode,
   WagerTransactionKind,
   WagerTransactionStatus,
 } from "../../src/domain/wager-transaction";
@@ -17,6 +18,8 @@ import { WagerTransactionRecord } from "../../src/infrastructure/database/wager-
 import { WalletLedgerEntryRecord } from "../../src/infrastructure/database/wallet-ledger-entry-record";
 import { WalletRecord } from "../../src/infrastructure/database/wallet-record";
 import { WalletsController } from "../../src/wallets.controller";
+import { WageringController } from "../../src/wagering.controller";
+import type { PostgresWagerResult } from "../../src/infrastructure/database/postgres-wager-processor";
 
 const schema = `wallet_http_${crypto.randomUUID().replaceAll("-", "")}`;
 
@@ -25,7 +28,7 @@ let app: INestApplication | undefined;
 let baseUrl = "";
 
 @Module({
-  controllers: [WalletsController],
+  controllers: [WalletsController, WageringController],
   providers: [
     {
       provide: DatabaseService,
@@ -263,4 +266,291 @@ test("falha na outbox desfaz wallet, OPENING e ledger", async () => {
       drop constraint wallet_http_force_failure
     `);
   }
+});
+
+async function createFundedWallet(): Promise<WalletView> {
+  const response = await postWallet(crypto.randomUUID(), "100.00");
+
+  expect(response.status).toBe(201);
+
+  return (await response.json()) as WalletView;
+}
+
+function wagerRequest(wallet: Pick<WalletView, "id" | "playerId">) {
+  return {
+    providerId: "http-provider",
+    externalTransactionId: crypto.randomUUID(),
+    playerId: wallet.playerId,
+    walletId: wallet.id,
+    roundId: "round-1",
+    gameId: "game-1",
+    kind: WagerTransactionKind.Bet,
+    money: { amount: "25.00", currency: "BRL" },
+  };
+}
+
+function postWager(body: unknown, key: string | undefined) {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    "x-correlation-id": "wager-http-test",
+  };
+
+  if (key !== undefined) {
+    headers["idempotency-key"] = key;
+  }
+
+  return fetch(`${baseUrl}/wagering/transactions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+}
+
+async function expectLedgerBalance(walletId: string, expected: string) {
+  const reader = orm.em.fork();
+
+  const wallet = await reader.findOneOrFail(WalletRecord, {
+    id: walletId,
+  });
+
+  const [totals] = await reader.execute<{ balance: string }[]>(
+    `
+      select coalesce(
+        sum(case when direction = 'CREDIT' then amount else -amount end),
+        0
+      )::numeric(20, 2)::text as balance
+      from "${schema}".wallet_ledger_entries
+      where wallet_id = ?
+    `,
+    [walletId],
+  );
+
+  expect(wallet.balance).toBe(expected);
+  expect(totals?.balance).toBe(expected);
+}
+
+test("header governa a idempotência e replay preserva o saldo original", async () => {
+  const wallet = await createFundedWallet();
+  const key = `http:${crypto.randomUUID()}`;
+
+  const input = {
+    ...wagerRequest(wallet),
+    idempotencyKey: "chave-do-body-ignorada",
+  };
+
+  const firstResponse = await postWager(input, key);
+
+  expect(firstResponse.status).toBe(200);
+
+  const first = (await firstResponse.json()) as PostgresWagerResult;
+
+  expect(first).toMatchObject({
+    status: WagerTransactionStatus.Processed,
+    balance: { amount: "75.00", currency: "BRL" },
+    idempotentReplay: false,
+  });
+
+  const stored = await orm.em
+    .fork()
+    .findOneOrFail(WagerTransactionRecord, { id: first.transactionId });
+
+  expect(stored.idempotencyKey).toBe(key);
+
+  const winResponse = await postWager(
+    {
+      ...wagerRequest(wallet),
+      kind: WagerTransactionKind.Win,
+      money: { amount: "10.00", currency: "BRL" },
+    },
+    `http:${crypto.randomUUID()}`,
+  );
+
+  expect(winResponse.status).toBe(200);
+
+  const beforeReplay = await counts();
+
+  const replayResponse = await postWager(
+    {
+      ...input,
+      idempotencyKey: "outro-valor-ignorado-no-body",
+    },
+    key,
+  );
+
+  expect(replayResponse.status).toBe(200);
+  expect(await replayResponse.json()).toEqual({
+    ...first,
+    idempotentReplay: true,
+  });
+
+  for (const conflict of [
+    {
+      body: {
+        ...input,
+        money: { amount: "26.00", currency: "BRL" },
+      },
+      key,
+    },
+    {
+      body: input,
+      key: `outra-chave:${crypto.randomUUID()}`,
+    },
+  ]) {
+    const response = await postWager(conflict.body, conflict.key);
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      code: "IDEMPOTENCY_CONFLICT",
+    });
+  }
+
+  expect(await counts()).toEqual(beforeReplay);
+
+  await expectLedgerBalance(wallet.id, "85.00");
+
+  expect(
+    await orm.em.fork().count(WalletLedgerEntryRecord, {
+      walletId: wallet.id,
+    }),
+  ).toBe(3);
+});
+
+test.each([
+  ["header ausente", WagerTransactionKind.Bet, undefined, "INVALID_INPUT"],
+  [
+    "OPENING externo",
+    WagerTransactionKind.Opening,
+    `invalid:${crypto.randomUUID()}`,
+    "INVALID_INPUT",
+  ],
+  [
+    "REFUND sem referência",
+    WagerTransactionKind.Refund,
+    `invalid:${crypto.randomUUID()}`,
+    "INVALID_OPERATION",
+  ],
+] as const)(
+  "retorna 400 para %s sem persistir efeitos",
+  async (_description, kind, key, code) => {
+    const wallet = await createFundedWallet();
+    const before = await counts();
+
+    const response = await postWager(
+      {
+        ...wagerRequest(wallet),
+        kind,
+        idempotencyKey: "body-nao-substitui-header",
+      },
+      key,
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code });
+    expect(await counts()).toEqual(before);
+  },
+);
+
+test("rejeição de negócio retorna 422 e permanece auditável", async () => {
+  const wallet = await createFundedWallet();
+
+  const response = await postWager(
+    {
+      ...wagerRequest(wallet),
+      money: { amount: "101.00", currency: "BRL" },
+    },
+    `http:${crypto.randomUUID()}`,
+  );
+
+  expect(response.status).toBe(422);
+
+  const result = (await response.json()) as PostgresWagerResult;
+
+  expect(result).toMatchObject({
+    status: WagerTransactionStatus.Rejected,
+    failureCode: FailureCode.InsufficientBalance,
+    balance: { amount: "100.00", currency: "BRL" },
+  });
+
+  const reader = orm.em.fork();
+
+  const stored = await reader.findOneOrFail(WagerTransactionRecord, {
+    id: result.transactionId,
+  });
+
+  expect(stored.status).toBe(WagerTransactionStatus.Rejected);
+  expect(stored.failureCode).toBe(FailureCode.InsufficientBalance);
+
+  expect(
+    await reader.count(WalletLedgerEntryRecord, {
+      transactionId: result.transactionId,
+    }),
+  ).toBe(0);
+
+  expect(
+    await reader.count(OutboxMessageRecord, {
+      aggregateId: result.transactionId,
+      eventType: "WagerTransactionRejected",
+    }),
+  ).toBe(1);
+
+  await expectLedgerBalance(wallet.id, "100.00");
+});
+
+test("referência ausente retorna 202 com reprocessamento agendado", async () => {
+  const wallet = await createFundedWallet();
+
+  const response = await postWager(
+    {
+      ...wagerRequest(wallet),
+      kind: WagerTransactionKind.Refund,
+      referenceExternalTransactionId: crypto.randomUUID(),
+    },
+    `http:${crypto.randomUUID()}`,
+  );
+
+  expect(response.status).toBe(202);
+
+  const result = (await response.json()) as PostgresWagerResult;
+
+  expect(result).toMatchObject({
+    status: WagerTransactionStatus.PendingReference,
+    balance: { amount: "100.00", currency: "BRL" },
+    idempotentReplay: false,
+  });
+
+  const reader = orm.em.fork();
+
+  const stored = await reader.findOneOrFail(WagerTransactionRecord, {
+    id: result.transactionId,
+  });
+
+  expect(stored.status).toBe(WagerTransactionStatus.PendingReference);
+  expect(stored.nextReferenceAttemptAt).not.toBeNull();
+
+  expect(
+    await reader.count(WalletLedgerEntryRecord, {
+      transactionId: result.transactionId,
+    }),
+  ).toBe(0);
+
+  await expectLedgerBalance(wallet.id, "100.00");
+});
+
+test("wallet inexistente retorna 404 sem persistir efeitos", async () => {
+  const before = await counts();
+
+  const response = await postWager(
+    wagerRequest({
+      id: crypto.randomUUID(),
+      playerId: crypto.randomUUID(),
+    }),
+    `http:${crypto.randomUUID()}`,
+  );
+
+  expect(response.status).toBe(404);
+  expect(await response.json()).toMatchObject({
+    code: "NOT_FOUND",
+  });
+
+  expect(await counts()).toEqual(before);
 });

@@ -4,9 +4,10 @@ import { HealthController } from "./health.controller";
 import { HttpExceptionFilter } from "./http-exception.filter";
 import { DatabaseService } from "./infrastructure/database/database.service";
 import { WalletsController } from "./wallets.controller";
+import { WageringController } from "./wagering.controller";
 
 @Module({
-  controllers: [HealthController, WalletsController],
+  controllers: [HealthController, WalletsController, WageringController],
   providers: [
     {
       provide: DatabaseService,
