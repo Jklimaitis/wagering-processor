@@ -1,5 +1,5 @@
 import "reflect-metadata";
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, setSystemTime, test } from "bun:test";
 import { Module, type INestApplication } from "@nestjs/common";
 import { APP_FILTER, NestFactory } from "@nestjs/core";
 import { MikroORM } from "@mikro-orm/postgresql";
@@ -21,6 +21,9 @@ import { WalletsController } from "../../src/wallets.controller";
 import { WageringController } from "../../src/wagering.controller";
 import type { PostgresWagerResult } from "../../src/infrastructure/database/postgres-wager-processor";
 import { ProviderTransactionsController } from "../../src/provider-transactions.controller";
+import { QueryOrder } from "@mikro-orm/core";
+import { encodeLedgerCursor } from "../../src/application/ledger-pagination";
+import type { LedgerPageView } from "../../src/infrastructure/database/postgres-financial-reader";
 
 const schema = `wallet_http_${crypto.randomUUID().replaceAll("-", "")}`;
 
@@ -686,3 +689,192 @@ test.each([
     });
   },
 );
+
+async function readLedgerPage(
+  walletId: string,
+  cursor?: string,
+  limit = 2,
+): Promise<LedgerPageView> {
+  const params = new URLSearchParams({
+    limit: String(limit),
+  });
+
+  if (cursor !== undefined) {
+    params.set("cursor", cursor);
+  }
+
+  const response = await fetch(
+    `${baseUrl}/wallets/${walletId}/ledger?${params}`,
+  );
+
+  expect(response.status).toBe(200);
+
+  return (await response.json()) as LedgerPageView;
+}
+
+async function creditOne(wallet: WalletView): Promise<void> {
+  const response = await postWager(
+    {
+      ...wagerRequest(wallet),
+      kind: WagerTransactionKind.Win,
+      money: { amount: "1.00", currency: "BRL" },
+    },
+    `http:${crypto.randomUUID()}`,
+  );
+
+  expect(response.status).toBe(200);
+}
+
+test("pagina empates de horário e inclui inserção posterior sem repetir entradas", async () => {
+  const at = new Date("2030-01-01T12:00:00.000Z");
+
+  setSystemTime(at);
+
+  try {
+    const wallet = await createFundedWallet();
+
+    await creditOne(wallet);
+    await creditOne(wallet);
+    await creditOne(wallet);
+
+    // Outra wallet não deve aparecer nas páginas.
+    await createFundedWallet();
+
+    const beforeFirstPage = await counts();
+    const first = await readLedgerPage(wallet.id);
+
+    expect(first.items).toHaveLength(2);
+    expect(first.items[0]?.createdAt).toBe(at.toISOString());
+    expect(first.items[1]?.createdAt).toBe(at.toISOString());
+    expect(await counts()).toEqual(beforeFirstPage);
+
+    if (first.nextCursor === null) {
+      throw new Error("Esperávamos uma segunda página.");
+    }
+
+    // Uma nova entrada passa a existir depois da primeira consulta.
+    setSystemTime(new Date(at.getTime() + 1_000));
+    await creditOne(wallet);
+
+    const beforeRemainingPages = await counts();
+
+    const second = await readLedgerPage(wallet.id, first.nextCursor);
+
+    const repeated = await readLedgerPage(wallet.id, first.nextCursor);
+
+    expect(repeated).toEqual(second);
+    expect(second.items).toHaveLength(2);
+
+    if (second.nextCursor === null) {
+      throw new Error("Esperávamos uma terceira página.");
+    }
+
+    const third = await readLedgerPage(wallet.id, second.nextCursor);
+
+    expect(third.items).toHaveLength(1);
+    expect(third.nextCursor).toBeNull();
+
+    const items = [...first.items, ...second.items, ...third.items];
+
+    const expected = await orm.em.fork().find(
+      WalletLedgerEntryRecord,
+      { walletId: wallet.id },
+      {
+        orderBy: {
+          createdAt: QueryOrder.ASC,
+          id: QueryOrder.ASC,
+        },
+      },
+    );
+
+    expect(items.map((item) => item.id)).toEqual(
+      expected.map((entry) => entry.id),
+    );
+
+    expect(new Set(items.map((item) => item.id)).size).toBe(5);
+
+    for (const item of items) {
+      expect(item.walletId).toBe(wallet.id);
+      expect(item.money.amount).toMatch(/^\d+\.\d{2}$/);
+      expect(item.balanceBefore.amount).toMatch(/^\d+\.\d{2}$/);
+      expect(item.balanceAfter.amount).toMatch(/^\d+\.\d{2}$/);
+    }
+
+    expect(await counts()).toEqual(beforeRemainingPages);
+    await expectLedgerBalance(wallet.id, "104.00");
+  } finally {
+    setSystemTime();
+  }
+});
+
+test("wallet sem movimentações retorna ledger vazio", async () => {
+  const response = await postWallet(crypto.randomUUID(), "0.00");
+
+  expect(response.status).toBe(201);
+
+  const wallet = (await response.json()) as WalletView;
+
+  const ledgerResponse = await fetch(`${baseUrl}/wallets/${wallet.id}/ledger`);
+
+  expect(ledgerResponse.status).toBe(200);
+  expect(await ledgerResponse.json()).toEqual({
+    items: [],
+    nextCursor: null,
+  });
+
+  await expectLedgerBalance(wallet.id, "0.00");
+});
+
+test("ledger de wallet inexistente retorna 404", async () => {
+  const response = await fetch(
+    `${baseUrl}/wallets/${crypto.randomUUID()}/ledger`,
+  );
+
+  expect(response.status).toBe(404);
+  expect(await response.json()).toMatchObject({
+    code: "NOT_FOUND",
+  });
+});
+
+test("rejeita limites inválidos e cursores incompatíveis", async () => {
+  const origin = await createFundedWallet();
+  await creditOne(origin);
+
+  const foreignPage = await readLedgerPage(origin.id, undefined, 1);
+
+  if (foreignPage.nextCursor === null) {
+    throw new Error("Esperávamos um cursor para a wallet de origem.");
+  }
+
+  const target = await createFundedWallet();
+  const before = await counts();
+
+  const unknownEntryCursor = encodeLedgerCursor(target.id, crypto.randomUUID());
+
+  const cases = [
+    ["?limit=0", "limit"],
+    ["?limit=101", "limit"],
+    ["?limit=1.5", "limit"],
+    ["?limit=2&limit=3", "limit"],
+    ["?cursor=%2B", "cursor"],
+    [`?cursor=${encodeURIComponent(foreignPage.nextCursor)}`, "cursor"],
+    [`?cursor=${encodeURIComponent(unknownEntryCursor)}`, "cursor"],
+  ] as const;
+
+  for (const [query, field] of cases) {
+    const response = await fetch(
+      `${baseUrl}/wallets/${target.id}/ledger${query}`,
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      code: "INVALID_INPUT",
+      field,
+    });
+  }
+
+  expect(await counts()).toEqual(before);
+
+  await expectLedgerBalance(origin.id, "101.00");
+  await expectLedgerBalance(target.id, "100.00");
+});

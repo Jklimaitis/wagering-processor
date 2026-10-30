@@ -6,6 +6,7 @@ import {
   Inject,
   Param,
   Post,
+  Query,
 } from "@nestjs/common";
 import {
   InvalidInputError,
@@ -19,7 +20,11 @@ import {
   PostgresWalletCreator,
   type WalletView,
 } from "./infrastructure/database/postgres-wallet-creator";
-import { PostgresFinancialReader } from "./infrastructure/database/postgres-financial-reader";
+import {
+  PostgresFinancialReader,
+  type LedgerPageView,
+} from "./infrastructure/database/postgres-financial-reader";
+import { parseLedgerPage } from "./application/ledger-pagination";
 
 @Controller("wallets")
 export class WalletsController {
@@ -35,6 +40,17 @@ export class WalletsController {
     );
   }
 
+  @Get(":walletId/ledger")
+  async ledger(
+    @Param("walletId") walletId: unknown,
+    @Query("cursor") cursor: unknown,
+    @Query("limit") limit: unknown,
+  ): Promise<LedgerPageView> {
+    return new PostgresFinancialReader(this.database.em).listLedger(
+      parseLedgerPage(walletId, cursor, limit),
+    );
+  }
+  
   @Post()
   async create(
     @Body() body: unknown,
