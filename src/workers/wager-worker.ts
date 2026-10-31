@@ -105,12 +105,6 @@ async function main(): Promise<void> {
           continue;
         }
 
-        if (result.heartbeatErrorName !== undefined) {
-          log("warn", "wager_heartbeat_failed", {
-            errorName: result.heartbeatErrorName,
-          });
-        }
-
         if (result.status === "ACKNOWLEDGED") {
           const { outcome } = result;
 

@@ -3,7 +3,6 @@ import { InvalidMoneyError } from "../../domain/money";
 import { InvalidWagerTransactionError } from "../../domain/wager-transaction";
 import { InboxPayloadConflictError } from "../database/postgres-inbox-wager-processor";
 import { IdempotencyConflictError } from "../database/postgres-wager-processor";
-import { SqsAcknowledgementError } from "./sqs-wager-message-handler";
 
 export const MAX_SQS_ATTEMPTS = 5;
 
@@ -18,15 +17,12 @@ export type SqsFailureDecision =
       action: "RETRY";
       attempt: number;
       delaySeconds: number;
-      reason: "TRANSIENT_ERROR" | "ACK_FAILED_AFTER_COMMIT";
+      reason: "TRANSIENT_ERROR";
     }
   | {
       action: "DLQ";
       attempt: number;
-      reason:
-        | PermanentFailureReason
-        | "RETRIES_EXHAUSTED"
-        | "ACK_FAILED_AFTER_COMMIT";
+      reason: PermanentFailureReason | "RETRIES_EXHAUSTED";
     };
 
 function permanentFailureReason(
@@ -78,15 +74,11 @@ export function decideSqsFailure(
     };
   }
 
-  const acknowledgementFailed = error instanceof SqsAcknowledgementError;
-
   if (attempt >= MAX_SQS_ATTEMPTS) {
     return {
       action: "DLQ",
       attempt,
-      reason: acknowledgementFailed
-        ? "ACK_FAILED_AFTER_COMMIT"
-        : "RETRIES_EXHAUSTED",
+      reason: "RETRIES_EXHAUSTED",
     };
   }
 
@@ -94,8 +86,6 @@ export function decideSqsFailure(
     action: "RETRY",
     attempt,
     delaySeconds: Math.min(2 ** (attempt - 1), 60),
-    reason: acknowledgementFailed
-      ? "ACK_FAILED_AFTER_COMMIT"
-      : "TRANSIENT_ERROR",
+    reason: "TRANSIENT_ERROR",
   };
 }

@@ -19,16 +19,6 @@ export interface HandledWagerMessage {
   result: PostgresWagerResult;
 }
 
-export class SqsAcknowledgementError extends Error {
-  constructor(
-    readonly outcome: HandledWagerMessage,
-    cause: unknown,
-  ) {
-    super("Falha no ack após confirmar o processamento.", { cause });
-    this.name = "SqsAcknowledgementError";
-  }
-}
-
 export class SqsWagerMessageHandler {
   constructor(
     private readonly client: SQSClient,
@@ -75,19 +65,15 @@ export class SqsWagerMessageHandler {
         result,
       };
 
-      try {
-        await this.client.send(
-          new DeleteMessageCommand({
-            QueueUrl: this.queueUrl,
-            ReceiptHandle: receiptHandle,
-          }),
-          {
-            abortSignal: AbortSignal.timeout(10_000),
-          },
-        );
-      } catch (error: unknown) {
-        throw new SqsAcknowledgementError(outcome, error);
-      }
+      await this.client.send(
+        new DeleteMessageCommand({
+          QueueUrl: this.queueUrl,
+          ReceiptHandle: receiptHandle,
+        }),
+        {
+          abortSignal: AbortSignal.timeout(10_000),
+        },
+      );
 
       return outcome;
     } catch (error: unknown) {

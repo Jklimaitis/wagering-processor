@@ -33,19 +33,14 @@ import { WalletMapper } from "../../src/infrastructure/database/wallet-mapper";
 import { WalletRecord } from "../../src/infrastructure/database/wallet-record";
 import { createSqsClient } from "../../src/infrastructure/messaging/sqs-client";
 import {
-  SqsAcknowledgementError,
   SqsWagerMessageHandler,
   WAGER_CONSUMER_NAME,
 } from "../../src/infrastructure/messaging/sqs-wager-message-handler";
 import { InvalidInputError } from "../../src/application/input-validation";
 import { SqsWagerFailureHandler } from "../../src/infrastructure/messaging/sqs-wager-failure-handler";
 import { MAX_SQS_ATTEMPTS } from "../../src/infrastructure/messaging/sqs-wager-failure-policy";
-import {
-  SqsWagerConsumer,
-  type SqsWagerPollResult,
-} from "../../src/infrastructure/messaging/sqs-wager-consumer";
+import { SqsWagerConsumer } from "../../src/infrastructure/messaging/sqs-wager-consumer";
 import { setTimeout as delay } from "node:timers/promises";
-import { LockMode } from "@mikro-orm/core";
 import { fileURLToPath } from "node:url";
 import { MetricsService } from "../../src/metrics.service";
 
@@ -595,8 +590,8 @@ test("falha no ack após commit não duplica efeitos na reentrega", async () => 
   );
 
   try {
-    await expect(handler.handle(message)).rejects.toBeInstanceOf(
-      SqsAcknowledgementError,
+    await expect(handler.handle(message)).rejects.toThrow(
+      "Falha simulada antes do envio do ack.",
     );
   } finally {
     client.middlewareStack.remove("failAcknowledgement");
@@ -896,7 +891,6 @@ test("consumer recebe, processa e confirma uma aposta real", async () => {
 
   expect(result.outcome.messageId).toBe(envelope.messageId);
   expect(result.outcome.result.idempotentReplay).toBe(false);
-  expect(result.heartbeatErrorName).toBeUndefined();
 
   await expectAppliedOnce(envelope);
   await expectSourceQueueEmpty();
@@ -936,131 +930,6 @@ test("consumer encaminha entrada inválida para DLQ", async () => {
 
   await expectBalanceMatchesLedger(envelope.data.walletId, "100.00");
   await expectSourceQueueEmpty();
-}, 20_000);
-
-test("heartbeat mantém a entrega invisível e encerramento aguarda a operação", async () => {
-  const { envelope } = await scenarioForTest();
-  await enqueueForTest(envelope);
-
-  const shutdown = new AbortController();
-
-  const consumer = new SqsWagerConsumer(
-    client,
-    currentQueueUrl(),
-    handlerForTest(),
-    failureHandlerForTest(),
-    {
-      waitTimeSeconds: 1,
-      visibilityTimeoutSeconds: 2,
-    },
-  );
-
-  let notifyHeartbeat!: () => void;
-  let heartbeatCount = 0;
-
-  const heartbeatObserved = new Promise<void>((resolve) => {
-    notifyHeartbeat = resolve;
-  });
-
-  client.middlewareStack.add(
-    (next, context) => async (args) => {
-      const result = await next(args);
-
-      if (context.commandName === "ChangeMessageVisibilityCommand") {
-        heartbeatCount += 1;
-        notifyHeartbeat();
-      }
-
-      return result;
-    },
-    {
-      step: "initialize",
-      name: "observeConsumerHeartbeat",
-    },
-  );
-
-  let polling: Promise<SqsWagerPollResult> | undefined;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-
-  try {
-    await orm.em.fork({ schema }).transactional(async (em) => {
-      await em.findOneOrFail(
-        WalletRecord,
-        { id: envelope.data.walletId },
-        { lockMode: LockMode.PESSIMISTIC_WRITE },
-      );
-
-      polling = consumer.poll(shutdown.signal);
-
-      await Promise.race([
-        heartbeatObserved,
-        polling.then(() => {
-          throw new Error(
-            "Consumer terminou antes de liberarmos o lock da wallet.",
-          );
-        }),
-        new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => {
-            reject(new Error("Heartbeat não foi confirmado pelo SQS."));
-          }, 5_000);
-        }),
-      ]);
-
-      // Simula o pedido de encerramento enquanto a operação está em andamento.
-      shutdown.abort();
-
-      // Ultrapassa a visibilidade inicial de dois segundos.
-      await delay(2_200);
-
-      expect(heartbeatCount).toBeGreaterThanOrEqual(2);
-
-      const competingReceive = await client.send(
-        new ReceiveMessageCommand({
-          QueueUrl: currentQueueUrl(),
-          MaxNumberOfMessages: 1,
-          WaitTimeSeconds: 0,
-        }),
-      );
-
-      expect(competingReceive.Messages ?? []).toHaveLength(0);
-
-      // O retorno deste callback libera o lock da wallet.
-    });
-
-    if (polling === undefined) {
-      throw new Error("Consumer não foi iniciado.");
-    }
-
-    const result = await polling;
-
-    expect(result.status).toBe("ACKNOWLEDGED");
-
-    if (result.status !== "ACKNOWLEDGED") {
-      throw new Error("A operação em andamento deveria terminar com ack.");
-    }
-
-    expect(result.heartbeatErrorName).toBeUndefined();
-    expect(result.outcome.result.status).toBe(WagerTransactionStatus.Processed);
-
-    await expectAppliedOnce(envelope);
-    await expectSourceQueueEmpty();
-
-    expect(await consumer.poll(shutdown.signal)).toEqual({
-      status: "STOPPED",
-    });
-  } finally {
-    shutdown.abort();
-
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-
-    if (polling !== undefined) {
-      await Promise.allSettled([polling]);
-    }
-
-    client.middlewareStack.remove("observeConsumerHeartbeat");
-  }
 }, 20_000);
 
 function startConsumerProcess(pauseBeforeAck = false) {

@@ -139,9 +139,11 @@ com o mesmo messageId de negócio encontram a mesma inbox `(consumerName,message
 Hash divergente da inbox é conflito. Outra entrega do mesmo negócio também encontra
 a idempotência financeira, mesmo com messageId diferente.
 
-Ack usa o receiptHandle atual e acontece após o commit externo. Erro no ack transporta
-o resultado já confirmado; a reentrega não repete os efeitos. Heartbeat renova a
-visibilidade enquanto há processamento e é encerrado antes de aplicar retry.
+Ack usa o receiptHandle atual e acontece após o commit externo. Se o ack falhar, o erro
+é tratado como transitório e a reentrega não repete os efeitos (a idempotência devolve
+o resultado já confirmado). Não há heartbeat de visibilidade: o processamento normal é
+curto e o visibilityTimeout de 30 segundos o cobre; se uma espera de lock o ultrapassar,
+a reentrega é inofensiva pela mesma idempotência.
 SIGTERM aborta long polling e conclui a operação em andamento; mensagens recebidas
 antes de começar o processamento podem ter visibilidade devolvida.
 
